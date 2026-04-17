@@ -166,6 +166,231 @@ def _segment_sentences(
     return result
 
 
+def _llm_segment_sentences(
+    score: ParsedScore,
+    semantics: List[BarSemantics],
+    client: 'GLMClient',
+    max_slots_per_sentence: int = 30,
+) -> Dict[int, Dict]:
+    """用 LLM 自然加标点来判断句子边界，替代纯字数阈值分句
+
+    流程：
+    1. 按 rest bar 切段落
+    2. 每段落拼接 seed 文本，调用 GLM 加标点
+    3. 将标点位置映射回 bar 边界
+    4. 以句号/问号/感叹号处的 bar 边界为句界
+
+    返回格式与 _segment_sentences 相同：
+    bar_index -> {"sentence_bars": [bar_indices], "sentence_seed": str}
+    """
+
+    # ---- 按 rest bar 切段落 ----
+    paragraphs: List[List[tuple]] = []  # [(bar_idx, slot_count, seed), ...]
+    current_para: List[tuple] = []
+    for i, bar in enumerate(score.bars):
+        if bar.is_rest_bar or bar.slot_count == 0:
+            if current_para:
+                paragraphs.append(current_para)
+            current_para = []
+            continue
+        sem = semantics[i] if i < len(semantics) else None
+        seed = sem.raw_text.strip() if (sem and not sem.is_empty and sem.raw_text.strip()) else ""
+        current_para.append((i, bar.slot_count, seed))
+    if current_para:
+        paragraphs.append(current_para)
+
+    result: Dict[int, Dict] = {}
+
+    for para in paragraphs:
+        # 拼接段落文本，记录每个 bar 的字符偏移边界
+        raw_text = ""
+        bar_boundaries = []  # (bar_idx, start_offset, end_offset)
+        offset = 0
+        for bar_idx, slot_count, seed in para:
+            raw_text += seed
+            bar_boundaries.append((bar_idx, offset, offset + len(seed)))
+            offset += len(seed)
+
+        if not raw_text.strip():
+            # 段落无 seed 文本，每个 bar 独立成句
+            for bar_idx, _, seed in para:
+                result[bar_idx] = {
+                    "sentence_bars": [bar_idx],
+                    "sentence_seed": seed,
+                }
+            continue
+
+        # ---- 调用 GLM 加标点 ----
+        punctuated = _call_llm_punctuate(client, raw_text)
+
+        if punctuated is None:
+            # LLM 调用失败，对本段落 fallback 到字数阈值
+            logger.warning("  LLM 标点标注失败，回退字数阈值分句")
+            _fallback_segment_paragraph(para, result)
+            continue
+
+        # ---- 校验：去标点后应与原文一致 ----
+        _PUNCT_SET = set("，。！？、；：,.!?;:")
+        cleaned = "".join(ch for ch in punctuated if ch not in _PUNCT_SET)
+        if cleaned != raw_text:
+            logger.warning(
+                f"  LLM 标点校验失败: 原文长{len(raw_text)}, 清洗后长{len(cleaned)}, 回退字数阈值"
+            )
+            logger.debug(f"    原文: {raw_text[:80]}...")
+            logger.debug(f"    清洗: {cleaned[:80]}...")
+            _fallback_segment_paragraph(para, result)
+            continue
+
+        # ---- 提取标点位置（映射到原文偏移） ----
+        punct_positions = []  # (原文字符偏移, 标点类型)
+        orig_pos = 0
+        for ch in punctuated:
+            if ch in _PUNCT_SET:
+                punct_positions.append((orig_pos, ch))
+            else:
+                orig_pos += 1
+
+        # ---- 将标点位置映射到 bar 边界 ----
+        # bar 边界（end_offset 位置）列表
+        boundary_offsets = [(bar_idx, end_off) for bar_idx, _, end_off in bar_boundaries]
+
+        # 对每个标点，找最近的 bar 边界（容差 ±2 字符）
+        TOLERANCE = 2
+        SENTENCE_END = set("。！？.!?")
+        CLAUSE_BREAK = set("，、,")
+
+        # bar_idx -> 该 bar 后面的标点类型（'sentence_end' 或 'clause_break'）
+        bar_after_punct: Dict[int, str] = {}
+
+        for punct_off, punct_ch in punct_positions:
+            best_bar_idx = None
+            best_dist = TOLERANCE + 1
+            for bar_idx, end_off in boundary_offsets:
+                dist = abs(punct_off - end_off)
+                if dist <= TOLERANCE and dist < best_dist:
+                    best_dist = dist
+                    best_bar_idx = bar_idx
+            if best_bar_idx is not None:
+                ptype = "sentence_end" if punct_ch in SENTENCE_END else "clause_break"
+                # sentence_end 优先级高于 clause_break
+                if best_bar_idx not in bar_after_punct or ptype == "sentence_end":
+                    bar_after_punct[best_bar_idx] = ptype
+
+        logger.info(f"  LLM 标点映射: {bar_after_punct}")
+
+        # ---- 按标点类型分组 bar ----
+        sentences: List[List[tuple]] = []
+        current_sent: List[tuple] = []
+        current_chars = 0
+        clause_break_points: List[int] = []  # 当前句内的逗号拆分点索引
+
+        for idx_in_para, (bar_idx, slot_count, seed) in enumerate(para):
+            current_sent.append((bar_idx, seed))
+            current_chars += slot_count
+
+            ptype = bar_after_punct.get(bar_idx)
+
+            if ptype == "sentence_end":
+                # 句号处断句
+                sentences.append(current_sent)
+                current_sent = []
+                current_chars = 0
+                clause_break_points = []
+            elif ptype == "clause_break":
+                # 逗号处记录为候选拆分点
+                clause_break_points.append(len(current_sent) - 1)
+                # 如果当前句子已超过字数上限，在最近的逗号处拆分
+                if current_chars > max_slots_per_sentence and clause_break_points:
+                    split_at = clause_break_points[-1]
+                    sentences.append(current_sent[:split_at + 1])
+                    remaining = current_sent[split_at + 1:]
+                    # 从 para 中查找剩余 bar 的 slot_count 来重新计算字数
+                    remaining_bar_ids = {bi for bi, _ in remaining}
+                    current_chars = sum(
+                        sc for bi, sc, _ in para if bi in remaining_bar_ids
+                    )
+                    current_sent = remaining
+                    clause_break_points = []
+
+        if current_sent:
+            sentences.append(current_sent)
+
+        # ---- 映射到 result ----
+        for sent in sentences:
+            bar_indices = [idx for idx, _ in sent]
+            sentence_seed = "，".join(s for _, s in sent if s)
+            for bar_idx, _ in sent:
+                result[bar_idx] = {
+                    "sentence_bars": bar_indices,
+                    "sentence_seed": sentence_seed,
+                }
+
+    return result
+
+
+def _call_llm_punctuate(client: 'GLMClient', raw_text: str) -> Optional[str]:
+    """调用 GLM 为一段歌词文本添加标点
+
+    Returns:
+        加了标点的文本，失败返回 None
+    """
+    system = "你是中文语言学专家。只添加标点符号，绝对不要修改、删除或替换任何文字。"
+    user = (
+        f"请为以下歌词添加合适的标点符号（逗号、句号、问号、感叹号）。\n"
+        f"规则：\n"
+        f"1. 只添加标点，不得修改任何一个字\n"
+        f"2. 不要添加引号、括号等其他符号\n"
+        f"3. 直接输出加了标点的文本，不要解释\n\n"
+        f"{raw_text}"
+    )
+    try:
+        result = client.chat(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.1,
+            max_tokens=len(raw_text) * 2 + 100,
+        )
+        if result:
+            # 去除首尾空白和可能的引号包裹
+            result = result.strip().strip('"\'""''')
+            return result
+        return None
+    except Exception as e:
+        logger.warning(f"  LLM 标点调用异常: {e}")
+        return None
+
+
+def _fallback_segment_paragraph(
+    para: List[tuple],
+    result: Dict[int, Dict],
+    char_threshold: int = 10,
+) -> None:
+    """字数阈值 fallback 分句（仅处理单个段落）"""
+    sentences: List[List[tuple]] = []
+    current_sent: List[tuple] = []
+    current_chars = 0
+    for bar_idx, slot_count, seed in para:
+        if current_sent and current_chars >= char_threshold and slot_count > 3:
+            sentences.append(current_sent)
+            current_sent = []
+            current_chars = 0
+        current_sent.append((bar_idx, seed))
+        current_chars += slot_count
+    if current_sent:
+        sentences.append(current_sent)
+
+    for sent in sentences:
+        bar_indices = [idx for idx, _ in sent]
+        sentence_seed = "，".join(s for _, s in sent if s)
+        for bar_idx, _ in sent:
+            result[bar_idx] = {
+                "sentence_bars": bar_indices,
+                "sentence_seed": sentence_seed,
+            }
+
+
 def _has_repetitive_chars(text: str, max_repeat: int = 2) -> bool:
     """检查是否有连续重复字超过 max_repeat 次"""
     if len(text) < max_repeat + 1:
@@ -768,7 +993,8 @@ def run_pipeline(
     logger.info(f"  使用模型: {client.model}")
 
     # 5. 构建句子分组（用于句内连贯性）
-    sentence_map = _segment_sentences(score, semantics)
+    logger.info("步骤 3.5: LLM 语义分句...")
+    sentence_map = _llm_segment_sentences(score, semantics, client)
     unique_sentences = {}
     for bar_idx, sinfo in sentence_map.items():
         key = tuple(sinfo["sentence_bars"])
