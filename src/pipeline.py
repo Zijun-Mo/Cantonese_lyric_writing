@@ -17,6 +17,7 @@ from src.preprocess.mandarin_segmenter import segment_all_bars, BarSemantics
 from src.rules.tone_template import melody_to_0243_template, score_to_0243_templates
 from src.rules.scorer import score_candidate
 from src.generation.glm_client import GLMClient
+from src.generation.polisher import iterative_polish
 from src.dictionary.cantonese_db import text_to_0243_list
 
 logging.basicConfig(
@@ -1353,6 +1354,21 @@ def run_pipeline(
         for i in still_low:
             _retry_bar_with_feedback(i, strong_client, round_label=f"[{UPGRADE_MODEL}] ")
             time.sleep(0.5)
+
+    # Step 6: 段落级整体润色
+    if enable_polish:
+        logger.info("\n步骤 6: 段落级评估与迭代润色...")
+        improved_count = iterative_polish(
+            client, bar_results, score, semantics, templates,
+            score_candidate,
+            theme_tags=lyric_input.theme_tags,
+            max_iterations=2,
+            quality_threshold=0.70,
+        )
+        if improved_count > 0:
+            logger.info(f"  润色完成，共改进 {improved_count} 个小节")
+        else:
+            logger.info(f"  所有段落质量达标或无需改动")
 
     # 8. 汇总
     results = [bar_results[i] for i in range(len(score.bars))]
