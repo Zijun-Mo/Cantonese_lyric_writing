@@ -972,6 +972,7 @@ def run_pipeline(
     lyric_input: LyricInput,
     enable_polish: bool = True,
     num_candidates: int = 5,
+    client: Optional[GLMClient] = None,
 ) -> Dict:
     """运行完整填词流程（逐小节生成）"""
     logger.info("=== 粤语填词流程开始 ===")
@@ -990,7 +991,7 @@ def run_pipeline(
     templates = score_to_0243_templates(score)
 
     # 4. 创建客户端
-    client = GLMClient()
+    client = client or GLMClient()
     logger.info(f"  使用模型: {client.model}")
 
     # 5. 构建句子分组（用于句内连贯性）
@@ -1350,7 +1351,7 @@ def run_pipeline(
     still_low = _collect_retry_bars(RETRY_THRESHOLD)
     if still_low:
         logger.info(f"\n步骤 5.5b: 升级模型 ({UPGRADE_MODEL}) 重试 {len(still_low)} 个仍低分小节...")
-        strong_client = GLMClient(model=UPGRADE_MODEL)
+        strong_client = GLMClient(model=UPGRADE_MODEL, api_key=getattr(client, "api_key", None))
         for i in still_low:
             _retry_bar_with_feedback(i, strong_client, round_label=f"[{UPGRADE_MODEL}] ")
             time.sleep(0.5)

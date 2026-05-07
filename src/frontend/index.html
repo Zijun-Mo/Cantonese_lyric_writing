@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>粤语填词系统</title>
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div class="brand">
+          <div class="logo" aria-hidden="true">粤</div>
+          <div>
+            <div class="title">粤语填词系统</div>
+            <div class="subtitle">简谱 + 普通话种子 → 粤语填词与评分</div>
+          </div>
+        </div>
+        <div class="status" id="status">就绪</div>
+      </header>
+
+      <main class="grid">
+        <section class="card">
+          <h2>鉴权</h2>
+          <p class="muted">
+            API Key 仅保存在当前页面内存中，不会写入磁盘。请在本机运行服务并使用本地地址访问。
+          </p>
+          <label class="field">
+            <span>API Key</span>
+            <input
+              id="apiKey"
+              type="password"
+              inputmode="text"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="Bearer key（不会保存）"
+            />
+          </label>
+          <div class="row">
+            <button class="btn btn-ghost" id="btnClearKey" type="button">清空</button>
+            <button class="btn btn-primary" id="btnRun" type="button">运行生成</button>
+          </div>
+          <div class="hint" id="hintKey"></div>
+        </section>
+
+        <section class="card">
+          <h2>输入</h2>
+          <div class="two">
+            <label class="field">
+              <span>简谱输入（用 <code>|</code> 分小节）</span>
+              <textarea id="jianpu" rows="7" placeholder="例如：3 3 5 | 6 - - | ..."></textarea>
+            </label>
+            <label class="field">
+              <span>普通话歌词输入（用 <code>|</code> 分小节，数量须与简谱一致）</span>
+              <textarea id="mandarin" rows="7" placeholder="例如：记忆中的你 | 渐渐远去 | ..."></textarea>
+            </label>
+          </div>
+
+          <div class="two">
+            <div class="field">
+              <span>主题标签（回车/逗号添加）</span>
+              <div class="tagInput" id="themeTags"></div>
+            </div>
+            <div class="field">
+              <span>风格标签（回车/逗号添加）</span>
+              <div class="tagInput" id="styleTags"></div>
+            </div>
+          </div>
+
+          <div class="two">
+            <label class="field">
+              <span>候选数（每小节）</span>
+              <input id="candidates" type="number" min="1" max="30" value="10" />
+            </label>
+            <label class="field inline">
+              <input id="noPolish" type="checkbox" />
+              <span>跳过润色（更快）</span>
+            </label>
+          </div>
+          <div class="hint" id="hintInput"></div>
+        </section>
+
+        <section class="card wide">
+          <h2>输出</h2>
+          <div class="scoreBox" id="scoreBox">
+            <div class="placeholder">运行后会以“乐谱框”方式对齐展示：简谱 / 普通话 / 粤语</div>
+          </div>
+          <div class="footerRow">
+            <div class="stat" id="statScore">评分：-</div>
+            <div class="muted" id="statBars"></div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <span class="muted">本页面调用本地服务 <code>/api/run</code>，请先运行 <code>python src/frontend/dev_server.py</code>。</span>
+      </footer>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
+

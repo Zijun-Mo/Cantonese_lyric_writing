@@ -30,8 +30,13 @@ def _load_api_key() -> str:
 class GLMClient:
     """智谱 GLM API 客户端"""
 
-    def __init__(self, model: Optional[str] = None, max_retries: int = 3):
-        self.api_key = _load_api_key()
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        max_retries: int = 3,
+        api_key: Optional[str] = None,
+    ):
+        self.api_key = (api_key or "").strip() or _load_api_key()
         self.model = model or _CONFIG['models']['candidate_model']
         self.max_retries = max_retries
         self.endpoint = _API_ENDPOINT
