@@ -40,6 +40,8 @@
           </label>
           <div class="row">
             <button class="btn btn-ghost" id="btnClearKey" type="button">清空</button>
+            <button class="btn btn-ghost" id="btnRunDemo" type="button">运行 Demo</button>
+            <button class="btn btn-ghost" id="btnCancel" type="button" disabled>暂停/终止</button>
             <button class="btn btn-primary" id="btnRun" type="button">运行生成</button>
           </div>
           <div class="hint" id="hintKey"></div>
@@ -47,15 +49,31 @@
 
         <section class="card">
           <h2>输入</h2>
-          <div class="two">
-            <label class="field">
-              <span>简谱输入（用 <code>|</code> 分小节）</span>
-              <textarea id="jianpu" rows="7" placeholder="例如：3 3 5 | 6 - - | ..."></textarea>
+          <div class="formatNote">
+            <div class="muted">
+              输入格式（每行一个小节，最终会自动拼接为程序需要的 <strong>简谱</strong> / <strong>普通话歌词</strong>，每个小节用 <code>|</code> 分隔）：
+            </div>
+            <ul class="formatList">
+              <li><strong>简谱</strong>：音符用空格分隔，休止/延音可写 <code>0</code> / <code>-</code></li>
+              <li><strong>高八度</strong>：用 <code>^</code> 表示高八度，例如 <code>^1</code>（在谱面中会渲染为数字上方加点）</li>
+              <li><strong>普通话</strong>：建议逐字/短句，系统会按该小节字位数自动对齐（多则截断，少则留空）</li>
+              <li><strong>小节数</strong>：简谱与普通话必须一一对应（行数一致）</li>
+            </ul>
+          </div>
+
+          <div class="inputToolbar">
+            <button class="btn btn-ghost" id="btnLoadDemo" type="button">填充 Demo</button>
+            <button class="btn btn-ghost" id="btnRenderSvg" type="button">生成简谱 SVG 预览</button>
+            <button class="btn btn-ghost" id="btnAddBar" type="button">+ 添加小节</button>
+            <button class="btn btn-ghost" id="btnClearBars" type="button">清空小节</button>
+            <label class="filePick">
+              <input id="fileJson" type="file" accept="application/json,.json" />
+              <span class="btn btn-ghost">选择 JSON 文件</span>
             </label>
-            <label class="field">
-              <span>普通话歌词输入（用 <code>|</code> 分小节，数量须与简谱一致）</span>
-              <textarea id="mandarin" rows="7" placeholder="例如：记忆中的你 | 渐渐远去 | ..."></textarea>
-            </label>
+          </div>
+
+          <div class="sheetInput" id="sheetInput">
+            <div class="placeholder">每行一个小节：左侧简谱，右侧普通话（会自动拼成用 | 分隔的格式）</div>
           </div>
 
           <div class="two">
@@ -84,8 +102,16 @@
 
         <section class="card wide">
           <h2>输出</h2>
+          <div class="progressPanel" id="progressPanel" style="display:none">
+            <div class="progressTitle">运行中</div>
+            <div class="progressStep" id="progressStep">准备中…</div>
+            <div class="muted progressTip">可随时点“暂停/终止”。完成后该区域会自动隐藏。</div>
+          </div>
           <div class="scoreBox" id="scoreBox">
-            <div class="placeholder">运行后会以“乐谱框”方式对齐展示：简谱 / 普通话 / 粤语</div>
+            <div class="placeholder">运行后会以“曲谱小节”方式展示：上方简谱数字，下方两行歌词逐字对齐</div>
+          </div>
+          <div class="scoreBox scoreBoxFull" id="scoreBoxFull">
+            <div class="placeholder">这里会额外生成一张“整页谱面”风格的大框（SVG），更接近简谱排版</div>
           </div>
           <div class="footerRow">
             <div class="stat" id="statScore">评分：-</div>

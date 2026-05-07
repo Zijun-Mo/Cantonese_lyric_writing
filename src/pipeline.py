@@ -11,6 +11,22 @@ import os
 import time
 from typing import List, Dict, Optional, Tuple
 
+
+def _force_utf8_stdio() -> None:
+    """在 Windows / IDE 终端里避免中文日志乱码。
+
+    Cursor 会把终端输出记录为 UTF-8 文本；如果 Python 以 cp936/gbk 写出，
+    读取时就会显示成“乱码”。这里统一 stdout/stderr 为 UTF-8。
+    """
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        # 不要因为编码设置失败而影响主流程
+        pass
+
 from src.input.schema import LyricInput
 from src.preprocess.jianpu_parser import parse_jianpu, ParsedScore, Bar
 from src.preprocess.mandarin_segmenter import segment_all_bars, BarSemantics
@@ -23,8 +39,13 @@ from src.dictionary.cantonese_db import text_to_0243_list
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    # 如果外部（如前端 dev_server）已注入 handler，则不要 force 覆盖，
+    # 否则会导致进度采集 handler 被移除。
+    force=(len(logging.getLogger().handlers) == 0),
 )
 logger = logging.getLogger(__name__)
+
+_force_utf8_stdio()
 
 
 def _group_into_phrases(
@@ -973,21 +994,30 @@ def run_pipeline(
     enable_polish: bool = True,
     num_candidates: int = 5,
     client: Optional[GLMClient] = None,
+    cancel_event: Optional[object] = None,
 ) -> Dict:
     """运行完整填词流程（逐小节生成）"""
+    def _check_cancel():
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            raise RuntimeError("cancelled")
+
     logger.info("=== 粤语填词流程开始 ===")
+    _check_cancel()
 
     # 1. 解析简谱
     logger.info("步骤 1: 解析简谱...")
+    _check_cancel()
     score = parse_jianpu(lyric_input.jianpu)
     logger.info(f"  共 {len(score.bars)} 小节，{score.total_slots} 个字位")
 
     # 2. 语义分词
     logger.info("步骤 2: 普通话语义槽提取...")
+    _check_cancel()
     semantics = segment_all_bars(lyric_input.mandarin_seed)
 
     # 3. 生成 0243 模板
     logger.info("步骤 3: 生成声调模板...")
+    _check_cancel()
     templates = score_to_0243_templates(score)
 
     # 4. 创建客户端
@@ -996,6 +1026,7 @@ def run_pipeline(
 
     # 5. 构建句子分组（用于句内连贯性）
     logger.info("步骤 3.5: LLM 语义分句...")
+    _check_cancel()
     sentence_map = _llm_segment_sentences(score, semantics, client)
     unique_sentences = {}
     for bar_idx, sinfo in sentence_map.items():
@@ -1014,6 +1045,7 @@ def run_pipeline(
         sent_prev_lyric = ""
 
         for sent_key in ordered_sent_keys:
+            _check_cancel()
             sinfo = multi_bar_sents[sent_key]
             bars_in_sent = sinfo["sentence_bars"]
 
@@ -1053,6 +1085,7 @@ def run_pipeline(
             best_scores = None
 
             for segments in sentence_candidates:
+                _check_cancel()
                 seg_scores = []
                 for seg, (bar_idx, slot_count, _) in zip(segments, bars_info):
                     tmpl = templates[bar_idx] if bar_idx < len(templates) else []
@@ -1125,6 +1158,7 @@ def run_pipeline(
         return {w for w, c in counts.items() if c >= 3}
 
     for i, bar in enumerate(score.bars):
+        _check_cancel()
         # 休止小节
         if bar.is_rest_bar or bar.slot_count == 0:
             bar_results[i] = {
@@ -1192,6 +1226,7 @@ def run_pipeline(
             sentence_context=sentence_context,
             sentence_seed=sentence_seed,
         )
+        _check_cancel()
 
         if not candidates:
             logger.warning(f"  小节 {i} 无有效候选，填充占位符")
@@ -1344,6 +1379,7 @@ def run_pipeline(
     if retry_bars:
         logger.info(f"\n步骤 5.5a: 协音标注重试 {len(retry_bars)} 个低分小节 (协音<{RETRY_THRESHOLD})...")
         for i in retry_bars:
+            _check_cancel()
             _retry_bar_with_feedback(i, client, round_label="[flash] ")
             time.sleep(0.3)
 
@@ -1353,12 +1389,14 @@ def run_pipeline(
         logger.info(f"\n步骤 5.5b: 升级模型 ({UPGRADE_MODEL}) 重试 {len(still_low)} 个仍低分小节...")
         strong_client = GLMClient(model=UPGRADE_MODEL, api_key=getattr(client, "api_key", None))
         for i in still_low:
+            _check_cancel()
             _retry_bar_with_feedback(i, strong_client, round_label=f"[{UPGRADE_MODEL}] ")
             time.sleep(0.5)
 
     # Step 6: 段落级整体润色
     if enable_polish:
         logger.info("\n步骤 6: 段落级评估与迭代润色...")
+        _check_cancel()
         improved_count = iterative_polish(
             client, bar_results, score, semantics, templates,
             score_candidate,
@@ -1366,6 +1404,7 @@ def run_pipeline(
             max_iterations=2,
             quality_threshold=0.70,
         )
+        _check_cancel()
         if improved_count > 0:
             logger.info(f"  润色完成，共改进 {improved_count} 个小节")
         else:
