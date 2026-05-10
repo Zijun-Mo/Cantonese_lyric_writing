@@ -89,9 +89,12 @@
             </label>
           </div>
 
-          <div class="sheetInput" id="sheetInput">
-            <div class="placeholder">每行一个小节：左侧简谱，右侧普通话（会自动拼成用 | 分隔的格式）</div>
-          </div>
+          <details class="inputDetails">
+            <summary>小节输入列表</summary>
+            <div class="sheetInput" id="sheetInput">
+              <div class="placeholder">每行一个小节：左侧简谱，右侧普通话（会自动拼成用 | 分隔的格式）</div>
+            </div>
+          </details>
 
           <div class="two">
             <div class="field">
@@ -124,12 +127,15 @@
             <div class="progressStep" id="progressStep">准备中…</div>
             <div class="muted progressTip">可随时点“暂停/终止”。完成后该区域会自动隐藏。</div>
           </div>
-          <div class="scoreBox" id="scoreBox">
-            <div class="placeholder">运行后会以“曲谱小节”方式展示：上方简谱数字，下方两行歌词逐字对齐</div>
-          </div>
           <div class="scoreBox scoreBoxFull" id="scoreBoxFull">
             <div class="placeholder">这里会额外生成一张“整页谱面”风格的大框（SVG），更接近简谱排版</div>
           </div>
+          <details class="outputDetails">
+            <summary>逐小节对齐表格</summary>
+            <div class="scoreBox" id="scoreBox">
+              <div class="placeholder">运行后会以“曲谱小节”方式展示：上方简谱数字，下方两行歌词逐字对齐</div>
+            </div>
+          </details>
           <div class="footerRow">
             <div class="stat" id="statScore">评分：-</div>
             <div class="muted" id="statBars"></div>

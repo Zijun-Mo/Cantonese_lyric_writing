@@ -313,6 +313,29 @@ input:focus, textarea:focus{ border-color: rgba(124,92,255,0.55); box-shadow: 0 
   min-height: 340px;
 }
 
+.inputDetails,
+.outputDetails{
+  margin-top: 12px;
+}
+.inputDetails summary,
+.outputDetails summary{
+  width: fit-content;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.04);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  user-select: none;
+}
+.inputDetails[open] summary,
+.outputDetails[open] summary{
+  margin-bottom: 8px;
+  color: var(--text);
+}
+
 .fullScoreSvg{
   width: 100%;
   height: auto;
