@@ -146,6 +146,41 @@ input:focus, textarea:focus{ border-color: rgba(124,92,255,0.55); box-shadow: 0 
   gap:10px;
   margin-top: 12px;
 }
+.segmented{
+  display:inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  padding: 3px;
+  gap: 3px;
+  border:1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.05);
+}
+.segmented label{
+  position:relative;
+  display:inline-flex;
+  align-items:center;
+}
+.segmented input{
+  position:absolute;
+  opacity:0;
+  pointer-events:none;
+}
+.segmented span{
+  min-width: 92px;
+  padding: 8px 12px;
+  border-radius: 9px;
+  color: var(--muted);
+  font-weight: 700;
+  text-align:center;
+  cursor:pointer;
+  border:1px solid transparent;
+}
+.segmented input:checked + span{
+  color: white;
+  border-color: rgba(124,92,255,0.45);
+  background: linear-gradient(135deg, rgba(124,92,255,0.95), rgba(73,211,255,0.70));
+}
 .btn{
   appearance:none;
   border:1px solid var(--border);
@@ -499,4 +534,3 @@ input:focus, textarea:focus{ border-color: rgba(124,92,255,0.55); box-shadow: 0 
   padding: 0 2px;
   font-size: 12px;
 }
-

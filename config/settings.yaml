@@ -2,10 +2,19 @@
 api:
   endpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
   key_file: "APIKey.txt"          # 相对项目根目录
+  deepseek_endpoint: "https://api.deepseek.com/chat/completions"
+  deepseek_key_file: "DeepSeekAPIKey.txt"
+  timeout_seconds: 60
+  deepseek_timeout_seconds: 120
+  deepseek_thinking_timeout_seconds: 300
 
 models:
   candidate_model: "glm-4-flash"   # 批量候选生成（快速便宜）
   polish_model: "glm-4-flash"      # 润色模型
+  glm_retry_model: "glm-4-plus"     # GLM 低分重试升级模型
+  deepseek_model: "deepseek-v4-pro" # DeepSeek 生成模型
+  deepseek_reasoning_effort: "high" # DeepSeek 思考模式强度
+  deepseek_thinking_min_tokens: 16384 # DeepSeek 思考模式最小输出 token 预算
 
 generation:
   candidates_per_bar: 10           # 每小节生成候选数

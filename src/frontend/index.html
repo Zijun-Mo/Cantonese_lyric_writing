@@ -26,6 +26,19 @@
           <p class="muted">
             API Key 仅保存在当前页面内存中，不会写入磁盘。请在本机运行服务并使用本地地址访问。
           </p>
+          <div class="field">
+            <span>模型服务</span>
+            <div class="segmented" role="radiogroup" aria-label="模型服务">
+              <label>
+                <input id="providerGlm" type="radio" name="provider" value="glm" checked />
+                <span>GLM</span>
+              </label>
+              <label>
+                <input id="providerDeepSeek" type="radio" name="provider" value="deepseek" />
+                <span>DeepSeek</span>
+              </label>
+            </div>
+          </div>
           <label class="field">
             <span>API Key</span>
             <input
@@ -128,4 +141,3 @@
     <script src="./app.js"></script>
   </body>
 </html>
-

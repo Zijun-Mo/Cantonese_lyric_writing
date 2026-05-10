@@ -13,6 +13,7 @@ env/
 
 # API 密钥（禁止提交）
 APIKey.txt
+DeepSeekAPIKey.txt
 
 # IDE
 .vscode/

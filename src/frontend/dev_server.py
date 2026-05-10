@@ -31,6 +31,10 @@ _RUN_STATE: Dict[str, Any] = {
 }
 
 _MAX_LOG_LINES = 120
+_PROVIDER_KEY_FILES = {
+    "glm": "APIKey.txt",
+    "deepseek": "DeepSeekAPIKey.txt",
+}
 
 
 class _ProgressHandler(logging.Handler):
@@ -150,11 +154,19 @@ def _extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
     return None
 
 
-def _try_load_local_api_key() -> Optional[str]:
-    """尝试从项目根目录的 APIKey.txt 读取 key（不回传给前端）。"""
+def _normalize_provider(value: Any) -> str:
+    provider = str(value or "glm").strip().lower()
+    if provider not in _PROVIDER_KEY_FILES:
+        raise ValueError("invalid_provider")
+    return provider
+
+
+def _try_load_local_api_key(provider: str = "glm") -> Optional[str]:
+    """尝试从项目根目录读取指定服务商的 key（不回传给前端）。"""
     try:
+        provider = _normalize_provider(provider)
         root = _repo_root()
-        key_path = os.path.join(root, "APIKey.txt")
+        key_path = os.path.join(root, _PROVIDER_KEY_FILES[provider])
         if not os.path.exists(key_path):
             return None
         with open(key_path, "r", encoding="utf-8") as f:
@@ -164,20 +176,29 @@ def _try_load_local_api_key() -> Optional[str]:
         return None
 
 
-def _json_response(handler: SimpleHTTPRequestHandler, status: int, data: Dict[str, Any]) -> None:
+def _local_key_status() -> Dict[str, bool]:
+    return {
+        provider: _try_load_local_api_key(provider) is not None
+        for provider in _PROVIDER_KEY_FILES
+    }
+
+
+def _json_response(handler: SimpleHTTPRequestHandler, status: int, data: Dict[str, Any]) -> bool:
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
     try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
         handler.wfile.write(body)
     except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
         # 客户端主动断开连接（例如前端 abort / 刷新），不应导致服务崩溃
-        return
+        logging.getLogger("frontend").warning("客户端已断开，跳过响应写入")
+        return False
+    return True
 
 
-def _run_pipeline_from_payload(payload: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+def _run_pipeline_from_payload(payload: Dict[str, Any], api_key: str, provider: str) -> Dict[str, Any]:
     # 延迟导入，避免启动时污染路径/耗时
     repo_root = _repo_root()
     if repo_root not in sys.path:
@@ -199,7 +220,7 @@ def _run_pipeline_from_payload(payload: Dict[str, Any], api_key: str) -> Dict[st
     if num_candidates <= 0:
         num_candidates = 10
 
-    client = GLMClient(api_key=api_key)
+    client = GLMClient(api_key=api_key, provider=provider)
     with _STATE_LOCK:
         cancel_event = _RUN_STATE.get("cancel_event")
 
@@ -239,8 +260,16 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as e:
                 return _json_response(self, 400, {"ok": False, "error": str(e)})
         if self.path == "/api/key_status":
-            has_key = _try_load_local_api_key() is not None
-            return _json_response(self, 200, {"ok": True, "has_key": has_key})
+            keys = _local_key_status()
+            return _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "has_key": keys.get("glm", False),
+                    "keys": keys,
+                },
+            )
         if self.path == "/api/progress":
             with _STATE_LOCK:
                 data = {
@@ -271,11 +300,15 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path != "/api/run":
             return _json_response(self, 404, {"error": "not_found"})
 
-        api_key = _extract_bearer_token(self.headers.get("Authorization")) or _try_load_local_api_key()
-        if not api_key:
-            return _json_response(self, 401, {"error": "missing_api_key"})
-
         payload = _read_json_body(self)
+        try:
+            provider = _normalize_provider(payload.get("provider", "glm"))
+        except ValueError:
+            return _json_response(self, 400, {"ok": False, "error": "invalid_provider"})
+
+        api_key = _extract_bearer_token(self.headers.get("Authorization")) or _try_load_local_api_key(provider)
+        if not api_key:
+            return _json_response(self, 401, {"ok": False, "error": "missing_api_key", "provider": provider})
 
         with _STATE_LOCK:
             if _RUN_STATE.get("running"):
@@ -292,10 +325,10 @@ class Handler(SimpleHTTPRequestHandler):
         root.addHandler(ph)
 
         try:
-            logging.getLogger("frontend").info("收到 /api/run 请求，开始运行流水线")
+            logging.getLogger("frontend").info(f"收到 /api/run 请求，provider={provider}，开始运行流水线")
             with _STATE_LOCK:
                 _RUN_STATE["step"] = "开始运行…"
-            result = _run_pipeline_from_payload(payload, api_key=api_key)
+            result = _run_pipeline_from_payload(payload, api_key=api_key, provider=provider)
             logging.getLogger("frontend").info("流水线完成，返回结果")
             with _STATE_LOCK:
                 _RUN_STATE["step"] = "完成"
@@ -367,4 +400,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -423,6 +423,26 @@ def _has_repetitive_chars(text: str, max_repeat: int = 2) -> bool:
     return False
 
 
+_TONE_DESC = {0: "低", 2: "中低", 4: "中高", 3: "高"}
+
+_TONE_GUIDE = """0243声调体系：
+- 0 低调：粤语阳平/阳上/阳入，例「人、你、食」
+- 2 中低：粤语阳去，例「大、后、夜」
+- 4 中高：粤语阴上/阴去/下阴入，例「好、世、百」
+- 3 高调：粤语阴平/上阴入，例「风、天、一」
+"""
+
+
+def _format_tone_targets(target_0243: List[int]) -> str:
+    if not target_0243:
+        return ""
+    parts = []
+    for i, t in enumerate(target_0243):
+        desc = _TONE_DESC.get(t, "?")
+        parts.append(f"{i+1}:{desc}({t})")
+    return " ".join(parts)
+
+
 def _build_bar_prompt(
     slot_count: int,
     seed_text: str,
@@ -435,16 +455,16 @@ def _build_bar_prompt(
     sentence_seed: str = "",
 ) -> Tuple[str, str]:
     """构建单小节填词 prompt"""
-    system = "你是粤语作词人。严格按要求字数输出。用词要有变化，避免重复。"
+    system = (
+        "你是专业粤语填词人，熟悉粤语九声、0243协音和流行歌词口语表达。"
+        "你必须只输出一个JSON对象，不要解释，不要Markdown。"
+    )
 
     # 0243 提示（只对短小节提供）
     tone_str = ""
-    if slot_count <= 7 and target_0243:
-        tone_hints = []
-        for i, t in enumerate(target_0243):
-            desc = {0: "低", 2: "中低", 4: "中高", 3: "高"}.get(t, "")
-            tone_hints.append(f"第{i+1}字:{desc}")
-        tone_str = f"\n声调建议：{'、'.join(tone_hints)}"
+    tone_targets = _format_tone_targets(target_0243)
+    if tone_targets:
+        tone_str = f"\n{_TONE_GUIDE}逐字目标声调：{tone_targets}"
 
     # 避免重复词汇
     avoid_str = ""
@@ -465,18 +485,23 @@ def _build_bar_prompt(
     example_placeholder = "字" * slot_count
     examples_json = ", ".join(f'"{example_placeholder}"' for _ in range(3))
 
-    user = f"""将以下普通话歌词改写为地道粤语，保持原意，恰好{slot_count}个字。
+    user = f"""任务：将普通话歌词改写为地道、可唱的粤语歌词，保持原意，恰好{slot_count}个汉字。
 
 原词：{seed_text}{context_str}{tone_str}{avoid_str}
 {f"主题：{', '.join(theme_tags)}" if theme_tags else ""}
 {f"上句：{prev_lyric}" if prev_lyric else ""}
 
-注意：每个候选必须恰好{slot_count}个汉字，不多不少。纯汉字无标点。
+硬性要求：
+1. 每个候选必须恰好{slot_count}个汉字，不多不少
+2. 只使用纯汉字，不要标点、空格、英文或数字
+3. 尽量匹配逐字目标声调，尤其优先照顾目标为3/4的高位字
+4. 粤语表达要自然，避免生硬直译和重复套话
+5. 候选之间要用不同措辞，不要只替换一两个字
 
-请给{num_candidates}个候选，JSON格式：
+请给{num_candidates}个候选，最终只输出JSON：
 {{"lyrics": [{examples_json}]}}
 
-现在请你写（每个恰好{slot_count}个汉字）："""
+现在请输出："""
 
     return system, user
 
@@ -611,7 +636,10 @@ def _fill_long_bar(
     sentence_seed: str = "",
 ) -> List[str]:
     """长小节（>7字）：生成长文本后用滑窗截取最佳子串"""
-    system = "你是粤语作词人。将普通话歌词改写为地道粤语。必须保持原词的意思和意象。用词丰富，不要标点。"
+    system = (
+        "你是专业粤语填词人。将普通话歌词改写为地道、可唱的粤语，"
+        "必须保留原词意思和意象。只输出纯汉字歌词段落，不要解释。"
+    )
 
     theme = ', '.join(theme_tags) if theme_tags else '抒情'
     avoid_text = ""
@@ -621,6 +649,9 @@ def _fill_long_bar(
         avoid_text += f"\n句内已生成「{sentence_context}」，请紧接续写，保持句意连贯。"
     if avoid_words:
         avoid_text += f"\n避免使用这些词：{'、'.join(avoid_words[:8])}"
+    tone_targets = _format_tone_targets(target_0243)
+    if tone_targets:
+        avoid_text += f"\n{_TONE_GUIDE}当前片段前{slot_count}字的目标声调：{tone_targets}"
 
     # 用不同的提示词变体增加多样性
     style_variants = [
@@ -641,7 +672,11 @@ def _fill_long_bar(
 {seed_info}
 主题：{theme}{avoid_text}
 
-要求：意思必须与原词一致或相近。请输出至少{slot_count + 10}个汉字的粤语歌词段落，纯汉字无标点："""
+要求：
+1. 意思必须与原词一致或相近，语气自然，适合演唱
+2. 尽量让前{slot_count}字贴近目标声调
+3. 请输出至少{slot_count + 10}个汉字的粤语歌词段落，纯汉字无标点
+4. 不要解释，不要JSON，不要换行："""
 
         result = client.chat(
             messages=[
@@ -775,8 +810,18 @@ def _fill_sentence(
     if not combined_seed:
         return []
 
-    system = "你是粤语作词人。将普通话歌词改写为地道粤语歌词。必须保持原意。"
+    system = (
+        "你是专业粤语填词人。将普通话歌词改写为连贯、地道、可唱的粤语歌词。"
+        "必须保留原意，只输出纯汉字歌词段落，不要解释。"
+    )
     theme = ', '.join(theme_tags) if theme_tags else '抒情'
+
+    # 构建全句声调模板
+    full_template = []
+    for bar_idx, slot_count, _ in bars_info:
+        tmpl = templates[bar_idx] if bar_idx < len(templates) else []
+        full_template.extend(tmpl[:slot_count])
+    sentence_tone_targets = _format_tone_targets(full_template)
 
     # 生成长文本（≥ total_chars），类似 _fill_long_bar 策略
     style_variants = [
@@ -789,6 +834,8 @@ def _fill_sentence(
     avoid_text = ""
     if prev_lyric:
         avoid_text = f"\n衔接上句「{prev_lyric}」，但不要重复上句的用词。"
+    if sentence_tone_targets:
+        avoid_text += f"\n{_TONE_GUIDE}全句前{total_chars}字目标声调：{sentence_tone_targets}"
 
     char_pool = []
     for attempt in range(max_retries):
@@ -798,7 +845,11 @@ def _fill_sentence(
 原词：{combined_seed}
 主题：{theme}{avoid_text}
 
-要求：意思必须与原词一致或相近。语意连贯通顺。请输出至少{total_chars + 15}个汉字的粤语歌词段落，纯汉字无标点："""
+要求：
+1. 意思必须与原词一致或相近，语意连贯通顺
+2. 尽量让前{total_chars}字贴近全句目标声调
+3. 请输出至少{total_chars + 15}个汉字的粤语歌词段落，纯汉字无标点
+4. 不要解释，不要JSON，不要换行："""
 
         result = client.chat(
             messages=[
@@ -827,12 +878,6 @@ def _fill_sentence(
     # 按组合声调分排序选出最优候选
     _stop_chars = set("的了在是有和与就都被把给让从到也不我你他她它们这那些")
     seed_keywords = set(c for c in combined_seed if '\u4e00' <= c <= '\u9fff' and c not in _stop_chars)
-
-    # 构建全句声调模板
-    full_template = []
-    for bar_idx, slot_count, _ in bars_info:
-        tmpl = templates[bar_idx] if bar_idx < len(templates) else []
-        full_template.extend(tmpl[:slot_count])
 
     all_scored = []
     for chars in long_enough:
@@ -895,10 +940,6 @@ def _tone_score_quick(text: str, target_0243: List[int]) -> float:
             score += 1.0
     return score
 
-
-_TONE_DESC = {0: "低", 2: "中低", 4: "中高", 3: "高"}
-
-
 def _build_tone_feedback(lyric: str, target_0243: List[int]) -> str:
     """生成逐字协音偏差标注，用于重试 prompt
 
@@ -935,14 +976,13 @@ def _build_retry_with_tone_prompt(
     avoid_words: List[str] = None,
 ) -> Tuple[str, str]:
     """构建带协音偏差标注的重试 prompt"""
-    system = "你是粤语作词人。严格按要求字数输出。注意声调匹配。"
+    system = (
+        "你是专业粤语填词修订师，任务是修正低分歌词的粤语声调匹配。"
+        "你必须只输出一个JSON对象，不要解释，不要Markdown。"
+    )
 
-    tone_hints = []
-    if target_0243:
-        for i, t in enumerate(target_0243):
-            desc = _TONE_DESC.get(t, "")
-            tone_hints.append(f"第{i+1}字:{desc}")
-    tone_str = f"\n目标声调：{'、'.join(tone_hints)}" if tone_hints else ""
+    tone_targets = _format_tone_targets(target_0243)
+    tone_str = f"\n{_TONE_GUIDE}逐字目标声调：{tone_targets}" if tone_targets else ""
 
     avoid_str = ""
     if avoid_words:
@@ -951,21 +991,27 @@ def _build_retry_with_tone_prompt(
     example_placeholder = "字" * slot_count
     examples_json = ", ".join(f'"{example_placeholder}"' for _ in range(3))
 
-    user = f"""将以下普通话歌词改写为地道粤语，保持原意，恰好{slot_count}个字。
+    user = f"""任务：重新生成更协音的粤语歌词，保持原意，恰好{slot_count}个汉字。
 
 原词：{seed_text}
 {f"主题：{', '.join(theme_tags)}" if theme_tags else ""}
 
-上次生成的「{old_lyric}」声调不够匹配，具体问题：
+上次生成：「{old_lyric}」
+上次声调问题：
 {tone_feedback}
-请特别注意上述不匹配位置的声调，重新生成。{tone_str}{avoid_str}
 
-注意：每个候选必须恰好{slot_count}个汉字，不多不少。纯汉字无标点。
+请按以下优先级修正：
+1. 优先修正上面列出的错位字位，让这些位置尽量贴近目标声调
+2. 其他位置也尽量匹配目标声调，但不要牺牲基本语义和自然度
+3. 不要原样返回「{old_lyric}」，候选之间必须有明显差异
+4. 每个候选必须恰好{slot_count}个汉字，不多不少
+5. 只使用纯汉字，不要标点、空格、英文或数字
+6. 语言要像粤语歌词，不要生硬逐字翻译{tone_str}{avoid_str}
 
-请给{num_candidates}个候选，JSON格式：
+请给{num_candidates}个候选，最终只输出JSON：
 {{"lyrics": [{examples_json}]}}
 
-现在请你写（每个恰好{slot_count}个汉字，声调尽量匹配目标）："""
+现在请输出："""
 
     return system, user
 
@@ -1022,7 +1068,8 @@ def run_pipeline(
 
     # 4. 创建客户端
     client = client or GLMClient()
-    logger.info(f"  使用模型: {client.model}")
+    model_label = client.mode_label() if hasattr(client, "mode_label") else client.model
+    logger.info(f"  使用模型: {model_label}")
 
     # 5. 构建句子分组（用于句内连贯性）
     logger.info("步骤 3.5: LLM 语义分句...")
@@ -1276,7 +1323,11 @@ def run_pipeline(
 
     # 5.5 多轮低分重试：带协音偏差标注 + 模型升级
     RETRY_THRESHOLD = 0.60
-    UPGRADE_MODEL = "glm-4-plus"
+    quality_client = client.for_quality_retry() if hasattr(client, "for_quality_retry") else GLMClient(
+        model="glm-4-plus",
+        api_key=getattr(client, "api_key", None),
+    )
+    quality_label = quality_client.mode_label() if hasattr(quality_client, "mode_label") else quality_client.model
 
     def _collect_retry_bars(threshold):
         """收集协音分低于阈值的小节（包含句级生成的bar）"""
@@ -1386,19 +1437,18 @@ def run_pipeline(
     # Round 2: 协音仍低于阈值的小节，升级到更强模型重试
     still_low = _collect_retry_bars(RETRY_THRESHOLD)
     if still_low:
-        logger.info(f"\n步骤 5.5b: 升级模型 ({UPGRADE_MODEL}) 重试 {len(still_low)} 个仍低分小节...")
-        strong_client = GLMClient(model=UPGRADE_MODEL, api_key=getattr(client, "api_key", None))
+        logger.info(f"\n步骤 5.5b: 升级模型/模式 ({quality_label}) 重试 {len(still_low)} 个仍低分小节...")
         for i in still_low:
             _check_cancel()
-            _retry_bar_with_feedback(i, strong_client, round_label=f"[{UPGRADE_MODEL}] ")
+            _retry_bar_with_feedback(i, quality_client, round_label=f"[{quality_label}] ")
             time.sleep(0.5)
 
     # Step 6: 段落级整体润色
     if enable_polish:
-        logger.info("\n步骤 6: 段落级评估与迭代润色...")
+        logger.info(f"\n步骤 6: 段落级评估与迭代润色（使用 {quality_label}）...")
         _check_cancel()
         improved_count = iterative_polish(
-            client, bar_results, score, semantics, templates,
+            quality_client, bar_results, score, semantics, templates,
             score_candidate,
             theme_tags=lyric_input.theme_tags,
             max_iterations=2,

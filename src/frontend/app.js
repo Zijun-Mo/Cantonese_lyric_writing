@@ -4,6 +4,13 @@ const $ = (id) => document.getElementById(id);
 
 let _progressTimer = null;
 let _runAbort = null;
+let _currentProvider = "glm";
+const _apiKeysByProvider = { glm: "", deepseek: "" };
+
+const PROVIDER_META = {
+  glm: { label: "GLM", keyFile: "APIKey.txt" },
+  deepseek: { label: "DeepSeek", keyFile: "DeepSeekAPIKey.txt" },
+};
 
 function setStatus(text, cls) {
   const el = $("status");
@@ -17,6 +24,56 @@ function setHint(id, text, kind) {
   el.textContent = text || "";
   el.classList.remove("error", "ok");
   if (kind) el.classList.add(kind);
+}
+
+function normalizeProvider(provider) {
+  return provider === "deepseek" ? "deepseek" : "glm";
+}
+
+function currentProvider() {
+  const checked = document.querySelector('input[name="provider"]:checked');
+  return normalizeProvider(checked?.value || _currentProvider);
+}
+
+function hasLocalKeyForProvider(provider) {
+  return Boolean(window.__localKeys?.[normalizeProvider(provider)]);
+}
+
+function updateKeyHint(message, kind) {
+  if (message) {
+    setHint("hintKey", message, kind || null);
+    return;
+  }
+
+  const provider = currentProvider();
+  const meta = PROVIDER_META[provider];
+  const input = $("apiKey");
+  if (!input) return;
+
+  if (input.value.trim()) {
+    input.placeholder = `${meta.label} API Key（不会保存）`;
+    setHint("hintKey", `将使用页面中输入的 ${meta.label} API Key`, "ok");
+    return;
+  }
+
+  if (hasLocalKeyForProvider(provider)) {
+    input.placeholder = `已检测到本地 ${meta.keyFile}，可留空直接运行`;
+    setHint("hintKey", `已检测到本地 ${meta.keyFile}，可不输入 API Key 直接运行`, "ok");
+  } else {
+    input.placeholder = `${meta.label} API Key（不会保存）`;
+    setHint("hintKey", `请先输入 ${meta.label} API Key（或在项目根目录放置非空 ${meta.keyFile}）`, null);
+  }
+}
+
+function switchProvider(provider) {
+  const nextProvider = normalizeProvider(provider);
+  const input = $("apiKey");
+  if (input) {
+    _apiKeysByProvider[_currentProvider] = input.value;
+    input.value = _apiKeysByProvider[nextProvider] || "";
+  }
+  _currentProvider = nextProvider;
+  updateKeyHint();
 }
 
 function splitBars(text) {
@@ -596,10 +653,13 @@ async function run(payloadOverride) {
   setHint("hintKey", "", null);
   setHint("hintInput", "", null);
 
+  const provider = normalizeProvider(payloadOverride?.provider || currentProvider());
+  const providerMeta = PROVIDER_META[provider];
   const apiKey = $("apiKey").value.trim();
-  const hasLocalKey = window.__hasLocalKey === true;
+  _apiKeysByProvider[provider] = apiKey;
+  const hasLocalKey = hasLocalKeyForProvider(provider);
   if (!apiKey && !hasLocalKey) {
-    setHint("hintKey", "请先输入 API Key（或在项目根目录放置非空 APIKey.txt）", "error");
+    setHint("hintKey", `请先输入 ${providerMeta.label} API Key（或在项目根目录放置非空 ${providerMeta.keyFile}）`, "error");
     setStatus("缺少 API Key", "bad");
     return;
   }
@@ -607,6 +667,7 @@ async function run(payloadOverride) {
   const base = buildBarsFromEditor(sheetEditor.getRows());
   const payload = {
     ...base,
+    provider,
     theme_tags: themeTagInput.getTags(),
     style_tags: styleTagInput.getTags(),
     candidates: Number($("candidates").value || 10),
@@ -743,10 +804,13 @@ $("btnLoadDemo").addEventListener("click", async () => {
 
 $("btnRunDemo").addEventListener("click", async () => {
   try {
+    const provider = currentProvider();
+    const providerMeta = PROVIDER_META[provider];
     const apiKey = $("apiKey").value.trim();
-    const hasLocalKey = window.__hasLocalKey === true;
+    _apiKeysByProvider[provider] = apiKey;
+    const hasLocalKey = hasLocalKeyForProvider(provider);
     if (!apiKey && !hasLocalKey) {
-      setHint("hintKey", "请先输入 API Key（或在项目根目录放置非空 APIKey.txt）", "error");
+      setHint("hintKey", `请先输入 ${providerMeta.label} API Key（或在项目根目录放置非空 ${providerMeta.keyFile}）`, "error");
       setStatus("缺少 API Key", "bad");
       return;
     }
@@ -755,6 +819,7 @@ $("btnRunDemo").addEventListener("click", async () => {
     themeTagInput.setTags(demo.theme_tags || []);
     styleTagInput.setTags(demo.style_tags || []);
     await run({
+      provider,
       jianpu: demo.jianpu,
       mandarin_seed: demo.mandarin_seed,
       theme_tags: demo.theme_tags || [],
@@ -846,25 +911,44 @@ $("btnRenderSvg").addEventListener("click", () => {
 });
 
 $("btnClearKey").addEventListener("click", () => {
+  const provider = currentProvider();
+  _apiKeysByProvider[provider] = "";
   $("apiKey").value = "";
-  setHint("hintKey", "已清空（内存中不再保留）", "ok");
+  updateKeyHint("已清空（当前模式的内存 key 不再保留）", "ok");
 });
 
 setStatus("就绪", null);
 
-// detect local APIKey.txt availability (server-side only)
+document.querySelectorAll('input[name="provider"]').forEach((input) => {
+  input.addEventListener("change", () => switchProvider(input.value));
+});
+
+const apiKeyInput = document.getElementById("apiKey");
+if (apiKeyInput) {
+  apiKeyInput.addEventListener("input", () => {
+    const provider = currentProvider();
+    _apiKeysByProvider[provider] = apiKeyInput.value;
+    updateKeyHint();
+  });
+}
+
+// detect local API key availability (server-side only)
+window.__localKeys = { glm: false, deepseek: false };
 window.__hasLocalKey = false;
 fetch("/api/key_status")
   .then((r) => r.json())
   .then((d) => {
-    if (d?.ok && d.has_key) {
-      window.__hasLocalKey = true;
-      const input = document.getElementById("apiKey");
-      if (input && !input.value) {
-        input.placeholder = "已检测到本地 APIKey.txt，可留空直接运行";
-      }
-      setHint("hintKey", "已检测到本地 APIKey.txt，可不输入 API Key 直接运行", "ok");
+    if (d?.ok) {
+      window.__localKeys = {
+        glm: Boolean(d?.keys?.glm ?? d.has_key),
+        deepseek: Boolean(d?.keys?.deepseek),
+      };
+      window.__hasLocalKey = window.__localKeys.glm;
+      updateKeyHint();
     }
   })
-  .catch(() => {});
+  .catch(() => {
+    updateKeyHint();
+  });
 
+updateKeyHint();
