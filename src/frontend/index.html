@@ -69,6 +69,10 @@
             <ul class="formatList">
               <li><strong>简谱</strong>：音符用空格分隔，休止/延音可写 <code>0</code> / <code>-</code></li>
               <li><strong>高八度</strong>：用 <code>^</code> 表示高八度，例如 <code>^1</code>（在谱面中会渲染为数字上方加点）</li>
+              <li><strong>低八度</strong>：用 <code>,</code> 表示低八度，例如 <code>,5</code>（在谱面中会渲染为数字下方加点）</li>
+              <li><strong>时值</strong>：附点 <code>.</code>、八分音符 <code>_</code>、十六分音符 <code>=</code> 可作后缀，例如 <code>3_.</code> / <code>3=</code></li>
+              <li><strong>延音</strong>：可写作后缀或独立 token，例如 <code>3-</code> / <code>3 -</code></li>
+              <li><strong>连音</strong>：用 <code>()</code> 包住一字多音，例如 <code>(1 2 3)</code> 只匹配一个字，也可跨小节</li>
               <li><strong>普通话</strong>：建议逐字/短句，系统会按该小节字位数自动对齐（多则截断，少则留空）</li>
               <li><strong>小节数</strong>：简谱与普通话必须一一对应（行数一致）</li>
             </ul>

@@ -8,7 +8,9 @@ import json
 import logging
 import sys
 import os
+import re
 import time
+from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 
 
@@ -46,6 +48,105 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _force_utf8_stdio()
+
+
+_ENGLISH_WORD_RE = re.compile(r"[A-Za-z]+")
+_LYRIC_TOKEN_RE = re.compile(r"[A-Za-z]+|[\u4e00-\u9fff]")
+
+
+@dataclass
+class LyricPlaceholder:
+    slot_index: int
+    text: str
+
+
+@dataclass
+class BarFillPlan:
+    bar_index: int
+    total_slot_count: int
+    fill_slot_count: int
+    seed_text: str
+    active_indices: List[int]
+    placeholders: List[LyricPlaceholder]
+
+
+def _strip_english_words(text: str) -> str:
+    """移除英文词，避免把英文占位发给模型。"""
+    cleaned = _ENGLISH_WORD_RE.sub("", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _strip_whitespace(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _build_bar_fill_plan(bar_index: int, seed_text: str, total_slot_count: int) -> BarFillPlan:
+    """记录英文占位所在字位，并计算实际需要生成的汉字数。"""
+    tokens = list(_LYRIC_TOKEN_RE.finditer(seed_text or ""))
+    placeholders: List[LyricPlaceholder] = []
+    placeholder_indices = set()
+
+    for slot_index, match in enumerate(tokens[:total_slot_count]):
+        token = match.group(0)
+        if _ENGLISH_WORD_RE.fullmatch(token):
+            placeholders.append(LyricPlaceholder(slot_index=slot_index, text=token))
+            placeholder_indices.add(slot_index)
+
+    active_indices = [
+        idx for idx in range(total_slot_count)
+        if idx not in placeholder_indices
+    ]
+    return BarFillPlan(
+        bar_index=bar_index,
+        total_slot_count=total_slot_count,
+        fill_slot_count=len(active_indices),
+        seed_text=_strip_english_words(seed_text),
+        active_indices=active_indices,
+        placeholders=placeholders,
+    )
+
+
+def _build_bar_fill_plans(score: ParsedScore, mandarin_seed: str) -> List[BarFillPlan]:
+    seed_bars = mandarin_seed.split("|")
+    plans = []
+    for i, bar in enumerate(score.bars):
+        seed = seed_bars[i] if i < len(seed_bars) else ""
+        plans.append(_build_bar_fill_plan(i, seed, bar.slot_count))
+    return plans
+
+
+def _active_items(items: List, plan: BarFillPlan) -> List:
+    return [items[idx] for idx in plan.active_indices if idx < len(items)]
+
+
+def _merge_lyric_placeholders(generated_lyric: str, plan: BarFillPlan) -> str:
+    """把模型生成的汉字填回非英文槽位，英文槽位原样保留。"""
+    if not plan.placeholders:
+        return generated_lyric
+
+    generated_chars = [ch for ch in generated_lyric if "\u4e00" <= ch <= "\u9fff"]
+    placeholder_by_index = {p.slot_index: p.text for p in plan.placeholders}
+    out = []
+    gen_pos = 0
+
+    for slot_index in range(plan.total_slot_count):
+        if slot_index in placeholder_by_index:
+            out.append(placeholder_by_index[slot_index])
+            continue
+        if gen_pos < len(generated_chars):
+            out.append(generated_chars[gen_pos])
+        else:
+            out.append("？")
+        gen_pos += 1
+
+    return "".join(out)
+
+
+def _placeholder_payload(plan: BarFillPlan) -> List[Dict]:
+    return [
+        {"slot_index": p.slot_index, "text": p.text}
+        for p in plan.placeholders
+    ]
 
 
 def _group_into_phrases(
@@ -229,9 +330,10 @@ def _llm_segment_sentences(
         bar_boundaries = []  # (bar_idx, start_offset, end_offset)
         offset = 0
         for bar_idx, slot_count, seed in para:
-            raw_text += seed
-            bar_boundaries.append((bar_idx, offset, offset + len(seed)))
-            offset += len(seed)
+            seed_for_punct = _strip_whitespace(seed)
+            raw_text += seed_for_punct
+            bar_boundaries.append((bar_idx, offset, offset + len(seed_for_punct)))
+            offset += len(seed_for_punct)
 
         if not raw_text.strip():
             # 段落无 seed 文本，每个 bar 独立成句
@@ -253,7 +355,7 @@ def _llm_segment_sentences(
 
         # ---- 校验：去标点后应与原文一致 ----
         _PUNCT_SET = set("，。！？、；：,.!?;:")
-        cleaned = "".join(ch for ch in punctuated if ch not in _PUNCT_SET)
+        cleaned = "".join(ch for ch in punctuated if ch not in _PUNCT_SET and not ch.isspace())
         if cleaned != raw_text:
             logger.warning(
                 f"  LLM 标点校验失败: 原文长{len(raw_text)}, 清洗后长{len(cleaned)}, 回退字数阈值"
@@ -1056,15 +1158,29 @@ def run_pipeline(
     score = parse_jianpu(lyric_input.jianpu)
     logger.info(f"  共 {len(score.bars)} 小节，{score.total_slots} 个字位")
 
+    bar_fill_plans = _build_bar_fill_plans(score, lyric_input.mandarin_seed)
+    english_placeholder_count = sum(len(p.placeholders) for p in bar_fill_plans)
+    if english_placeholder_count:
+        fill_slots = sum(p.fill_slot_count for p in bar_fill_plans)
+        logger.info(
+            f"  检测到 {english_placeholder_count} 个英文占位，"
+            f"实际生成 {fill_slots} 个汉字，其余按原文复制"
+        )
+    sanitized_seed = "|".join(p.seed_text for p in bar_fill_plans)
+
     # 2. 语义分词
     logger.info("步骤 2: 普通话语义槽提取...")
     _check_cancel()
-    semantics = segment_all_bars(lyric_input.mandarin_seed)
+    semantics = segment_all_bars(sanitized_seed)
 
     # 3. 生成 0243 模板
     logger.info("步骤 3: 生成声调模板...")
     _check_cancel()
-    templates = score_to_0243_templates(score)
+    raw_templates = score_to_0243_templates(score)
+    templates = [
+        _active_items(raw_templates[i] if i < len(raw_templates) else [], plan)
+        for i, plan in enumerate(bar_fill_plans)
+    ]
 
     # 4. 创建客户端
     client = client or GLMClient()
@@ -1109,9 +1225,15 @@ def run_pipeline(
             bars_info = []
             for bar_idx in bars_in_sent:
                 bar_obj = score.bars[bar_idx]
+                plan = bar_fill_plans[bar_idx]
+                if plan.fill_slot_count == 0:
+                    continue
                 sem = semantics[bar_idx] if bar_idx < len(semantics) else None
                 seed = sem.raw_text.strip() if (sem and not sem.is_empty and sem.raw_text.strip()) else ""
-                bars_info.append((bar_idx, bar_obj.slot_count, seed))
+                bars_info.append((bar_idx, plan.fill_slot_count, seed))
+
+            if len(bars_info) < 2:
+                continue
 
             # 生成候选
             sentence_candidates = _fill_sentence(
@@ -1137,7 +1259,8 @@ def run_pipeline(
                 for seg, (bar_idx, slot_count, _) in zip(segments, bars_info):
                     tmpl = templates[bar_idx] if bar_idx < len(templates) else []
                     bar_obj = score.bars[bar_idx]
-                    beat_strs = [n.beat_strength for n in bar_obj.singable_notes]
+                    plan = bar_fill_plans[bar_idx]
+                    beat_strs = _active_items([n.beat_strength for n in bar_obj.singable_notes], plan)
                     sem = semantics[bar_idx] if bar_idx < len(semantics) else None
                     core_imgs = sem.core_images() if sem and not sem.is_empty else []
                     must_kw = [s.word for s in sem.slots if s.weight == 'must_keep'] if sem and not sem.is_empty else []
@@ -1157,17 +1280,22 @@ def run_pipeline(
                 logger.info(f"  句子 bars={bars_in_sent}: 「{combined}」 平均总分={best_avg:.2f}")
                 for bi_pos, (seg, (bar_idx, slot_count, _seed), sc) in enumerate(
                         zip(best_segments, bars_info, best_scores)):
+                    plan = bar_fill_plans[bar_idx]
+                    merged_seg = _merge_lyric_placeholders(seg, plan)
                     # 收集其他候选中该位置的段落
                     other_segs = []
                     for segs in sentence_candidates[:5]:
                         if bi_pos < len(segs) and segs[bi_pos] != seg:
-                            other_segs.append(segs[bi_pos])
+                            other_segs.append(_merge_lyric_placeholders(segs[bi_pos], plan))
                     sentence_results[bar_idx] = {
                         "bar_index": bar_idx,
-                        "slot_count": slot_count,
+                        "slot_count": plan.total_slot_count,
+                        "fill_slot_count": slot_count,
+                        "lyric_placeholders": _placeholder_payload(plan),
                         "is_rest": False,
-                        "best_lyric": seg,
-                        "candidates": [{"lyric": seg, "score": sc["total"]}] +
+                        "best_lyric": merged_seg,
+                        "generated_lyric": seg,
+                        "candidates": [{"lyric": merged_seg, "score": sc["total"]}] +
                                        [{"lyric": s, "score": 0} for s in other_segs[:4]],
                         "score": sc,
                     }
@@ -1206,31 +1334,54 @@ def run_pipeline(
 
     for i, bar in enumerate(score.bars):
         _check_cancel()
+        plan = bar_fill_plans[i]
         # 休止小节
         if bar.is_rest_bar or bar.slot_count == 0:
             bar_results[i] = {
                 "bar_index": i, "slot_count": 0, "is_rest": True,
-                "best_lyric": "", "candidates": [], "score": None,
+                "fill_slot_count": 0, "lyric_placeholders": [],
+                "best_lyric": "", "generated_lyric": "",
+                "candidates": [], "score": None,
             }
             prev_lyric = ""  # 段落重置
             continue
 
         singable_count += 1
 
+        if plan.fill_slot_count == 0:
+            fixed_lyric = _merge_lyric_placeholders("", plan)
+            bar_results[i] = {
+                "bar_index": i,
+                "slot_count": plan.total_slot_count,
+                "fill_slot_count": 0,
+                "lyric_placeholders": _placeholder_payload(plan),
+                "is_rest": False,
+                "best_lyric": fixed_lyric,
+                "generated_lyric": "",
+                "candidates": [{"lyric": fixed_lyric, "score": None}],
+                "score": None,
+            }
+            logger.info(
+                f"  小节 {i} ({singable_count}): {plan.total_slot_count}字位全为英文占位，"
+                f"直接保留 \"{fixed_lyric}\""
+            )
+            prev_lyric = ""
+            continue
+
         # 检查是否已由句级生成处理
         if i in sentence_results:
             bar_results[i] = sentence_results[i]
-            _update_used_words(sentence_results[i]["best_lyric"])
-            prev_lyric = sentence_results[i]["best_lyric"]
+            _update_used_words(sentence_results[i].get("generated_lyric", sentence_results[i]["best_lyric"]))
+            prev_lyric = sentence_results[i].get("generated_lyric", sentence_results[i]["best_lyric"])
             logger.info(
-                f"  小节 {i} ({singable_count}): {bar.slot_count}字 [句级] "
+                f"  小节 {i} ({singable_count}): {bar.slot_count}字位/生成{sentence_results[i]['fill_slot_count']}字 [句级] "
                 f"=> \"{sentence_results[i]['best_lyric']}\" "
                 f"(协音={sentence_results[i]['score']['tone']:.2f}, "
                 f"总分={sentence_results[i]['score']['total']:.2f})"
             )
             continue
 
-        slot_count = bar.slot_count
+        slot_count = plan.fill_slot_count
         tmpl = templates[i] if i < len(templates) else []
 
         # 获取语义种子
@@ -1241,7 +1392,7 @@ def run_pipeline(
             seed_text = "承接前文情感"
 
         logger.info(
-            f"  小节 {i} ({singable_count}): {slot_count}字, "
+            f"  小节 {i} ({singable_count}): {bar.slot_count}字位/生成{slot_count}字, "
             f"语义=\"{seed_text[:20]}\", 声调={tmpl}"
         )
 
@@ -1257,7 +1408,9 @@ def run_pipeline(
                 if prev_bar_idx == i:
                     break
                 if prev_bar_idx in bar_results and not bar_results[prev_bar_idx]["is_rest"]:
-                    context_parts.append(bar_results[prev_bar_idx]["best_lyric"])
+                    context_parts.append(
+                        bar_results[prev_bar_idx].get("generated_lyric", bar_results[prev_bar_idx]["best_lyric"])
+                    )
             sentence_context = "".join(context_parts)
 
         # 生成候选
@@ -1277,15 +1430,21 @@ def run_pipeline(
 
         if not candidates:
             logger.warning(f"  小节 {i} 无有效候选，填充占位符")
+            generated_lyric = "？" * slot_count
             bar_results[i] = {
-                "bar_index": i, "slot_count": slot_count,
-                "is_rest": False, "best_lyric": "？" * slot_count,
+                "bar_index": i,
+                "slot_count": plan.total_slot_count,
+                "fill_slot_count": slot_count,
+                "lyric_placeholders": _placeholder_payload(plan),
+                "is_rest": False,
+                "best_lyric": _merge_lyric_placeholders(generated_lyric, plan),
+                "generated_lyric": generated_lyric,
                 "candidates": [], "score": None,
             }
             continue
 
         # 评分并选最优
-        beat_strengths = [n.beat_strength for n in bar.singable_notes]
+        beat_strengths = _active_items([n.beat_strength for n in bar.singable_notes], plan)
         # 提取语义关键词用于评分
         core_imgs = sem.core_images() if sem and not sem.is_empty else []
         must_kw = [s.word for s in sem.slots if s.weight == 'must_keep'] if sem and not sem.is_empty else []
@@ -1301,9 +1460,10 @@ def run_pipeline(
             scored.append((lyric, s))
 
         scored.sort(key=lambda x: x[1]["total"], reverse=True)
-        best_lyric, best_score = scored[0]
+        best_generated_lyric, best_score = scored[0]
+        best_lyric = _merge_lyric_placeholders(best_generated_lyric, plan)
 
-        tone_detail = text_to_0243_list(best_lyric)
+        tone_detail = text_to_0243_list(best_generated_lyric)
         logger.info(
             f"    => \"{best_lyric}\" "
             f"(协音={best_score['tone']:.2f}, 总分={best_score['total']:.2f}) "
@@ -1311,14 +1471,21 @@ def run_pipeline(
         )
 
         bar_results[i] = {
-            "bar_index": i, "slot_count": slot_count,
+            "bar_index": i,
+            "slot_count": plan.total_slot_count,
+            "fill_slot_count": slot_count,
+            "lyric_placeholders": _placeholder_payload(plan),
             "is_rest": False, "best_lyric": best_lyric,
-            "candidates": [{"lyric": ly, "score": sc["total"]} for ly, sc in scored[:5]],
+            "generated_lyric": best_generated_lyric,
+            "candidates": [
+                {"lyric": _merge_lyric_placeholders(ly, plan), "score": sc["total"]}
+                for ly, sc in scored[:5]
+            ],
             "score": best_score,
         }
 
-        _update_used_words(best_lyric)
-        prev_lyric = best_lyric
+        _update_used_words(best_generated_lyric)
+        prev_lyric = best_generated_lyric
         time.sleep(0.3)  # 限流
 
     # 5.5 多轮低分重试：带协音偏差标注 + 模型升级
@@ -1340,16 +1507,23 @@ def run_pipeline(
     def _retry_bar_with_feedback(bar_idx, use_client, round_label=""):
         """用协音偏差标注重试单个小节，返回是否改进"""
         bar = score.bars[bar_idx]
-        slot_count = bar.slot_count
+        plan = bar_fill_plans[bar_idx]
+        slot_count = plan.fill_slot_count
+        if slot_count == 0:
+            return False
         tmpl = templates[bar_idx] if bar_idx < len(templates) else []
         sem = semantics[bar_idx] if bar_idx < len(semantics) else None
         seed_text = sem.raw_text.strip() if (sem and not sem.is_empty and sem.raw_text.strip()) else "承接前文情感"
-        old_lyric = bar_results[bar_idx]["best_lyric"]
+        old_lyric = bar_results[bar_idx].get("generated_lyric", bar_results[bar_idx]["best_lyric"])
+        old_display_lyric = bar_results[bar_idx]["best_lyric"]
         old_tone = bar_results[bar_idx]["score"]["tone"]
 
         # 生成协音偏差标注
         tone_feedback = _build_tone_feedback(old_lyric, tmpl)
-        logger.info(f"  {round_label}重试小节 {bar_idx}: {slot_count}字, 原协音={old_tone:.2f}")
+        logger.info(
+            f"  {round_label}重试小节 {bar_idx}: {plan.total_slot_count}字位/生成{slot_count}字, "
+            f"原协音={old_tone:.2f}"
+        )
         if tone_feedback:
             logger.info(f"    偏差: {tone_feedback}")
 
@@ -1400,7 +1574,7 @@ def run_pipeline(
             logger.info(f"    => 无有效候选")
             return False
 
-        beat_strengths = [n.beat_strength for n in bar.singable_notes]
+        beat_strengths = _active_items([n.beat_strength for n in bar.singable_notes], plan)
         core_imgs = sem.core_images() if sem and not sem.is_empty else []
         must_kw = [s.word for s in sem.slots if s.weight == 'must_keep'] if sem and not sem.is_empty else []
         scored = []
@@ -1410,16 +1584,24 @@ def run_pipeline(
                                 target_char_count=slot_count)
             scored.append((lyric, s))
         scored.sort(key=lambda x: x[1]["total"], reverse=True)
-        new_lyric, new_score = scored[0]
+        new_generated_lyric, new_score = scored[0]
+        new_lyric = _merge_lyric_placeholders(new_generated_lyric, plan)
 
         if "？" in new_lyric:
             logger.info(f"    => 重试返回占位符，保留原结果")
             return False
         elif new_score["tone"] > old_tone:
-            logger.info(f"    => 改进: \"{new_lyric}\" (协音={new_score['tone']:.2f} > {old_tone:.2f})")
+            logger.info(
+                f"    => 改进: \"{old_display_lyric}\" → \"{new_lyric}\" "
+                f"(协音={new_score['tone']:.2f} > {old_tone:.2f})"
+            )
             bar_results[bar_idx]["best_lyric"] = new_lyric
+            bar_results[bar_idx]["generated_lyric"] = new_generated_lyric
             bar_results[bar_idx]["score"] = new_score
-            bar_results[bar_idx]["candidates"] = [{"lyric": ly, "score": sc["total"]} for ly, sc in scored[:5]]
+            bar_results[bar_idx]["candidates"] = [
+                {"lyric": _merge_lyric_placeholders(ly, plan), "score": sc["total"]}
+                for ly, sc in scored[:5]
+            ]
             return True
         else:
             logger.info(f"    => 未改进 (协音={new_score['tone']:.2f})")

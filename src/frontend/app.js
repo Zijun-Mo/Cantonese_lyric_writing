@@ -237,7 +237,7 @@ function createSheetEditor(containerEl) {
       j.className = "colJ";
       j.type = "text";
       j.value = r.jianpu;
-      j.placeholder = "例如：0 3 6 5 6 3 2";
+      j.placeholder = "例如：0 3_ (6= 5.) ^1 ,6 3-";
       j.addEventListener("input", () => {
         r.jianpu = j.value;
       });
@@ -298,8 +298,8 @@ async function fetchDemo() {
   return data.demo;
 }
 
-function onlyHanChars(s) {
-  return Array.from(String(s || "")).filter((ch) => ch >= "\u4e00" && ch <= "\u9fff");
+function lyricTokens(s) {
+  return String(s || "").match(/[A-Za-z]+|[\u4e00-\u9fff]/g) || [];
 }
 
 function tokenizeJianpuBar(bar) {
@@ -310,34 +310,167 @@ function tokenizeJianpuBar(bar) {
     .filter(Boolean);
 }
 
-function pickNoteTokens(tokens, slotCount) {
+function splitJianpuGroupMarkers(raw) {
+  let token = String(raw || "").trim();
+  let starts = 0;
+  let ends = 0;
+
+  while (token.startsWith("(")) {
+    starts += 1;
+    token = token.slice(1);
+  }
+
+  while (token.endsWith(")")) {
+    ends += 1;
+    token = token.slice(0, -1);
+  }
+
+  return { token, starts, ends };
+}
+
+function parseJianpuToken(raw) {
+  const original = String(raw || "").trim();
+  if (!original) return null;
+  if (/^-+$/.test(original)) {
+    return { type: "sustain", raw: original, units: original.length, lyricSlot: false };
+  }
+
+  const match = original.match(/^([\^,v]*)([0-7])([._=]*)(-*)$/);
+  if (!match) {
+    return {
+      type: "unknown",
+      raw: original,
+      base: original,
+      up: 0,
+      down: 0,
+      underline: 0,
+      dotCount: 0,
+      sustain: 0,
+      lyricSlot: false,
+    };
+  }
+
+  const [, prefix, base, suffix, tieDashes] = match;
+  let up = 0;
+  let down = 0;
+  for (const mark of prefix) {
+    if (mark === "^") up += 1;
+    else down += 1;
+  }
+
+  const dotCount = (suffix.match(/\./g) || []).length;
+  const underline = suffix.includes("=") ? 2 : suffix.includes("_") ? 1 : 0;
+  const sustain = tieDashes.length;
+
+  const type = base === "0" ? "rest" : "note";
+  return {
+    type,
+    raw: original,
+    base,
+    up,
+    down,
+    underline,
+    dotCount,
+    sustain,
+    lyricSlot: type === "note",
+  };
+}
+
+function appendSustainEvents(events, count, ownerIndex, slurId) {
+  for (let i = 0; i < count; i++) {
+    events.push({ type: "sustain", raw: "-", base: "-", ownerIndex, slurId: slurId || null, lyricSlot: false });
+  }
+}
+
+function parseJianpuScoreEvents(bars) {
+  const parsedBars = [];
+  const slurStack = [];
+  const slurStarted = new Map();
+  let nextSlurId = 1;
+
+  for (const bar of bars || []) {
+    const events = [];
+    let lastPitchIndex = null;
+
+    for (const raw of tokenizeJianpuBar(bar)) {
+      const marked = splitJianpuGroupMarkers(raw);
+
+      for (let i = 0; i < marked.starts; i++) {
+        const id = nextSlurId;
+        nextSlurId += 1;
+        slurStack.push(id);
+      }
+
+      const slurId = slurStack.length ? slurStack[slurStack.length - 1] : null;
+      const parsed = parseJianpuToken(marked.token);
+
+      if (parsed) {
+        if (parsed.type === "sustain") {
+          appendSustainEvents(events, parsed.units || 1, lastPitchIndex, slurId);
+        } else {
+          const event = { ...parsed, sustain: 0, slurId };
+          if (event.type === "note" && slurId) {
+            event.lyricSlot = !slurStarted.get(slurId);
+            slurStarted.set(slurId, true);
+          }
+
+          events.push(event);
+          if (event.type === "note") lastPitchIndex = events.length - 1;
+          if (parsed.sustain > 0) appendSustainEvents(events, parsed.sustain, lastPitchIndex, slurId);
+        }
+      }
+
+      for (let i = 0; i < marked.ends; i++) {
+        const ended = slurStack.pop();
+        if (ended != null) slurStarted.delete(ended);
+      }
+    }
+
+    parsedBars.push({ events });
+  }
+
+  return parsedBars;
+}
+
+function parseJianpuBarEvents(bar) {
+  return parseJianpuScoreEvents([bar])[0]?.events || [];
+}
+
+function countSingableEvents(events) {
+  return (events || []).filter((event) => event?.lyricSlot).length;
+}
+
+function formatJianpuEventLabel(event) {
+  if (!event) return "";
+  if (event.type === "sustain") return "-";
+  if (event.type === "unknown") return event.raw || "";
+  if (event.type !== "note" && event.type !== "rest") return "";
+
+  const octave = `${"^".repeat(event.up || 0)}${",".repeat(event.down || 0)}`;
+  const duration = event.underline >= 2 ? "=" : event.underline === 1 ? "_" : "";
+  const dots = ".".repeat(event.dotCount || 0);
+  return `${octave}${event.base || ""}${dots}${duration}`;
+}
+
+function pickNoteTokensFromEvents(events, slotCount) {
   if (!slotCount || slotCount <= 0) return [];
-  const prefer = tokens.filter((t) => t !== "-" && t !== "0");
-  const alt = tokens.filter((t) => t !== "-");
-  const chosen = (prefer.length >= slotCount ? prefer : alt).slice(0, slotCount);
+  const chosen = (events || [])
+    .filter((event) => event.lyricSlot)
+    .map((event) => formatJianpuEventLabel(event))
+    .slice(0, slotCount);
   while (chosen.length < slotCount) chosen.push("");
   return chosen;
+}
+
+function pickNoteTokens(tokens, slotCount) {
+  const barText = Array.isArray(tokens) ? tokens.join(" ") : String(tokens || "");
+  return pickNoteTokensFromEvents(parseJianpuBarEvents(barText), slotCount);
 }
 
 function padOrTruncChars(chars, n) {
   const out = chars.slice(0, n);
   while (out.length < n) out.push("");
   return out;
-}
-
-function parseJianpuToken(raw) {
-  let t = String(raw || "").trim();
-  let up = 0;
-  let down = 0;
-  while (t.startsWith("^")) {
-    up += 1;
-    t = t.slice(1);
-  }
-  while (t.startsWith("v")) {
-    down += 1;
-    t = t.slice(1);
-  }
-  return { base: t, up, down };
 }
 
 function addOctaveDots(svg, x, y, count, direction, color) {
@@ -354,10 +487,86 @@ function addOctaveDots(svg, x, y, count, direction, color) {
   }
 }
 
+function renderJianpuEvent(svg, event, cx, noteY, monoFont) {
+  if (!event || event.type === "placeholder") return;
+
+  const ns = "http://www.w3.org/2000/svg";
+  if (event.type === "sustain") {
+    const line = document.createElementNS(ns, "line");
+    line.setAttribute("x1", String(cx - 8));
+    line.setAttribute("x2", String(cx + 8));
+    line.setAttribute("y1", String(noteY - 5));
+    line.setAttribute("y2", String(noteY - 5));
+    line.setAttribute("stroke", "rgba(255,255,255,0.82)");
+    line.setAttribute("stroke-width", "2");
+    line.setAttribute("stroke-linecap", "round");
+    svg.appendChild(line);
+    return;
+  }
+
+  if (event.type !== "note" && event.type !== "rest" && event.type !== "unknown") return;
+
+  if (event.up > 0) {
+    addOctaveDots(svg, cx, noteY - 8, event.up, -1, "rgba(255,255,255,0.86)");
+  }
+  if (event.down > 0) {
+    addOctaveDots(svg, cx, noteY + 7, event.down, +1, "rgba(255,255,255,0.78)");
+  }
+
+  const note = document.createElementNS(ns, "text");
+  note.setAttribute("x", String(cx));
+  note.setAttribute("y", String(noteY));
+  note.setAttribute("text-anchor", "middle");
+  note.setAttribute("fill", event.type === "rest" ? "rgba(255,255,255,0.70)" : "rgba(255,255,255,0.94)");
+  note.setAttribute("font-family", monoFont);
+  note.setAttribute("font-size", event.type === "unknown" ? "12" : "17");
+  note.setAttribute("font-weight", event.type === "rest" ? "650" : "760");
+  note.textContent = event.type === "unknown" ? event.raw || "" : event.base || "";
+  svg.appendChild(note);
+
+  for (let i = 0; i < Math.min(event.dotCount || 0, 3); i++) {
+    const dot = document.createElementNS(ns, "circle");
+    dot.setAttribute("cx", String(cx + 10 + i * 4));
+    dot.setAttribute("cy", String(noteY - 5));
+    dot.setAttribute("r", "1.6");
+    dot.setAttribute("fill", "rgba(255,255,255,0.86)");
+    svg.appendChild(dot);
+  }
+
+  const underlineCount = Math.min(event.underline || 0, 2);
+  for (let i = 0; i < underlineCount; i++) {
+    const line = document.createElementNS(ns, "line");
+    line.setAttribute("x1", String(cx - 8));
+    line.setAttribute("x2", String(cx + 8));
+    line.setAttribute("y1", String(noteY + 8 + i * 5));
+    line.setAttribute("y2", String(noteY + 8 + i * 5));
+    line.setAttribute("stroke", "rgba(255,255,255,0.84)");
+    line.setAttribute("stroke-width", "1.6");
+    line.setAttribute("stroke-linecap", "round");
+    svg.appendChild(line);
+  }
+}
+
+function renderSlurArc(svg, startX, endX, noteY) {
+  if (endX - startX < 12) return;
+
+  const ns = "http://www.w3.org/2000/svg";
+  const y = noteY - 30;
+  const controlY = y - Math.min(12, Math.max(6, (endX - startX) / 10));
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", `M ${startX} ${y} Q ${(startX + endX) / 2} ${controlY} ${endX} ${y}`);
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "rgba(255,255,255,0.72)");
+  path.setAttribute("stroke-width", "1.5");
+  path.setAttribute("stroke-linecap", "round");
+  svg.appendChild(path);
+}
+
 function renderResult({ jianpuBars, mandarinBars, cantoBars, barScores, barMeta }) {
   const box = $("scoreBox");
   box.innerHTML = "";
   const maxBars = Math.max(jianpuBars.length, mandarinBars.length, cantoBars.length, barMeta?.length || 0);
+  const parsedScoreBars = parseJianpuScoreEvents(jianpuBars);
 
   const sheet = document.createElement("div");
   sheet.className = "sheet";
@@ -392,9 +601,9 @@ function renderResult({ jianpuBars, mandarinBars, cantoBars, barScores, barMeta 
     grid.className = "slotGrid";
     grid.style.gridTemplateColumns = `repeat(${slotCount}, minmax(20px, 1fr))`;
 
-    const jTokens = pickNoteTokens(tokenizeJianpuBar(jianpuBars[i]), slotCount);
-    const mandChars = padOrTruncChars(onlyHanChars(mandarinBars[i]), slotCount);
-    const cantoChars = padOrTruncChars(onlyHanChars(cantoBars[i]), slotCount);
+    const jTokens = pickNoteTokensFromEvents(parsedScoreBars[i]?.events || [], slotCount);
+    const mandChars = padOrTruncChars(lyricTokens(mandarinBars[i]), slotCount);
+    const cantoChars = padOrTruncChars(lyricTokens(cantoBars[i]), slotCount);
 
     // Row 1: notes
     for (let s = 0; s < slotCount; s++) {
@@ -435,21 +644,34 @@ function renderFullScoreSVG({ jianpuBars, mandarinBars, cantoBars, barMeta, barS
   const slotW = 28;
   const padX = 18;
   const measureGap = 10;
-  const staffTop = 26;
-  const staffH = 56;
-  const lineGap = 7;
-  const lyricY1 = staffTop + staffH + 18;
+  const staffTop = 28;
+  const noteBaseline = staffTop + 28;
+  const lyricY1 = noteBaseline + 35;
   const lyricY2 = lyricY1 + 18;
   const headY = 14;
   const lineH = lyricY2 + 26;
+  const parsedScoreBars = parseJianpuScoreEvents(jianpuBars);
 
   const measures = [];
   for (let i = 0; i < maxBars; i++) {
     const meta = barMeta?.[i] || {};
-    const isRest = Boolean(meta.is_rest);
-    const slotCount = Number(meta.slot_count ?? 0) || 0;
-    const w = isRest || slotCount <= 0 ? 90 : Math.max(90, slotCount * slotW + 16);
-    measures.push({ i, isRest, slotCount, w });
+    const events = parsedScoreBars[i]?.events || [];
+    const parsedSlotCount = countSingableEvents(events);
+    const metaSlotCount = Number(meta.slot_count ?? 0) || 0;
+    const inferredRest = events.length > 0 && parsedSlotCount === 0;
+    const isRest = Boolean(meta.is_rest) || (metaSlotCount <= 0 && inferredRest);
+    const slotCount = isRest ? 0 : Math.max(metaSlotCount, parsedSlotCount);
+    const visualEvents = events.slice();
+
+    let missingLyricSlots = slotCount - parsedSlotCount;
+    while (missingLyricSlots > 0) {
+      visualEvents.push({ type: "placeholder", raw: "", base: "", lyricSlot: true });
+      missingLyricSlots -= 1;
+    }
+
+    const visualCount = Math.max(visualEvents.length, 1);
+    const w = Math.max(90, visualCount * slotW + 16);
+    measures.push({ i, isRest, slotCount, visualEvents, w });
   }
 
   const maxLineW = Math.max(520, (host.clientWidth || 980) - 28);
@@ -490,6 +712,7 @@ function renderFullScoreSVG({ jianpuBars, mandarinBars, cantoBars, barMeta, barS
     "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', 'Noto Sans SC'";
   const monoFont =
     "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace, 'Microsoft YaHei'";
+  const slurPoints = new Map();
 
   for (let li = 0; li < lines.length; li++) {
     const yOff = li * lineH;
@@ -507,20 +730,7 @@ function renderFullScoreSVG({ jianpuBars, mandarinBars, cantoBars, barMeta, barS
     svg.appendChild(leftBoundary);
 
     for (const m of lineMs) {
-      const { i, isRest, slotCount, w } = m;
-
-      // staff lines
-      for (let k = 0; k < 5; k++) {
-        const y = yOff + staffTop + k * lineGap;
-        const ln = document.createElementNS(ns, "line");
-        ln.setAttribute("x1", String(x + 6));
-        ln.setAttribute("x2", String(x + w - 6));
-        ln.setAttribute("y1", String(y));
-        ln.setAttribute("y2", String(y));
-        ln.setAttribute("stroke", "rgba(255,255,255,0.18)");
-        ln.setAttribute("stroke-width", "1");
-        svg.appendChild(ln);
-      }
+      const { i, isRest, slotCount, visualEvents, w } = m;
 
       // bar borders
       const right = document.createElementNS(ns, "line");
@@ -545,10 +755,10 @@ function renderFullScoreSVG({ jianpuBars, mandarinBars, cantoBars, barMeta, barS
           : `bar ${i + 1}${sc != null ? `  score ${Number(sc).toFixed(3)}` : ""}`;
       svg.appendChild(title);
 
-      if (isRest || slotCount <= 0) {
+      if ((isRest || slotCount <= 0) && !visualEvents.length) {
         const rest = document.createElementNS(ns, "text");
         rest.setAttribute("x", String(x + w / 2));
-        rest.setAttribute("y", String(yOff + staffTop + 22));
+        rest.setAttribute("y", String(yOff + noteBaseline));
         rest.setAttribute("text-anchor", "middle");
         rest.setAttribute("fill", "rgba(255,255,255,0.55)");
         rest.setAttribute("font-family", monoFont);
@@ -559,32 +769,21 @@ function renderFullScoreSVG({ jianpuBars, mandarinBars, cantoBars, barMeta, barS
         continue;
       }
 
-      const jTokens = pickNoteTokens(tokenizeJianpuBar(jianpuBars[i]), slotCount);
-      const mandChars = padOrTruncChars(onlyHanChars(mandarinBars[i]), slotCount);
-      const cantoChars = padOrTruncChars(onlyHanChars(cantoBars[i]), slotCount);
+      const mandChars = padOrTruncChars(lyricTokens(mandarinBars[i]), slotCount);
+      const cantoChars = padOrTruncChars(lyricTokens(cantoBars[i]), slotCount);
 
       const innerX = x + 10;
-      for (let s = 0; s < slotCount; s++) {
+      let lyricIndex = 0;
+      for (let s = 0; s < visualEvents.length; s++) {
         const cx = innerX + s * slotW + slotW / 2;
+        const event = visualEvents[s];
 
-        const parsed = parseJianpuToken(jTokens[s] || "");
-        if (parsed.up > 0) {
-          addOctaveDots(svg, cx, yOff + staffTop + 15, parsed.up, -1, "rgba(255,255,255,0.86)");
+        renderJianpuEvent(svg, event, cx, yOff + noteBaseline, monoFont);
+        if (event?.slurId) {
+          if (!slurPoints.has(event.slurId)) slurPoints.set(event.slurId, []);
+          slurPoints.get(event.slurId).push({ x: cx, y: yOff + noteBaseline, line: li });
         }
-        if (parsed.down > 0) {
-          addOctaveDots(svg, cx, yOff + staffTop + 15, parsed.down, +1, "rgba(255,255,255,0.78)");
-        }
-
-        const note = document.createElementNS(ns, "text");
-        note.setAttribute("x", String(cx));
-        note.setAttribute("y", String(yOff + staffTop + 18));
-        note.setAttribute("text-anchor", "middle");
-        note.setAttribute("fill", "rgba(255,255,255,0.92)");
-        note.setAttribute("font-family", monoFont);
-        note.setAttribute("font-size", "15");
-        note.setAttribute("font-weight", "700");
-        note.textContent = parsed.base || "";
-        svg.appendChild(note);
+        if (!event?.lyricSlot) continue;
 
         const m1 = document.createElementNS(ns, "text");
         m1.setAttribute("x", String(cx));
@@ -593,7 +792,7 @@ function renderFullScoreSVG({ jianpuBars, mandarinBars, cantoBars, barMeta, barS
         m1.setAttribute("fill", "rgba(255,255,255,0.78)");
         m1.setAttribute("font-family", baseFont);
         m1.setAttribute("font-size", "13");
-        m1.textContent = mandChars[s] || "";
+        m1.textContent = mandChars[lyricIndex] || "";
         svg.appendChild(m1);
 
         const m2 = document.createElementNS(ns, "text");
@@ -603,11 +802,26 @@ function renderFullScoreSVG({ jianpuBars, mandarinBars, cantoBars, barMeta, barS
         m2.setAttribute("fill", "rgba(255,255,255,0.96)");
         m2.setAttribute("font-family", baseFont);
         m2.setAttribute("font-size", "13");
-        m2.textContent = cantoChars[s] || "";
+        m2.textContent = cantoChars[lyricIndex] || "";
         svg.appendChild(m2);
+        lyricIndex += 1;
       }
 
       x += w + measureGap;
+    }
+  }
+
+  for (const points of slurPoints.values()) {
+    const byLine = new Map();
+    for (const point of points) {
+      if (!byLine.has(point.line)) byLine.set(point.line, []);
+      byLine.get(point.line).push(point);
+    }
+
+    for (const linePoints of byLine.values()) {
+      if (linePoints.length < 2) continue;
+      linePoints.sort((a, b) => a.x - b.x);
+      renderSlurArc(svg, linePoints[0].x, linePoints[linePoints.length - 1].x, linePoints[0].y);
     }
   }
 
@@ -886,14 +1100,16 @@ $("btnRenderSvg").addEventListener("click", () => {
     }
     const jBars = splitBars(base.jianpu);
     const mBars = splitBars(base.mandarin_seed);
+    const parsedScoreBars = parseJianpuScoreEvents(jBars);
     const barMeta = jBars.map((jb, idx) => {
-      const tokens = tokenizeJianpuBar(jb);
-      const slotCount = Math.max(
-        pickNoteTokens(tokens, 999).filter((x) => x !== "").length,
-        onlyHanChars(mBars[idx] || "").length,
-        1
-      );
-      const isRest = slotCount <= 0 || tokens.every((t) => t === "0" || t === "-" || t === "");
+      const events = parsedScoreBars[idx]?.events || [];
+      const noteCount = countSingableEvents(events);
+      const isRest = events.length > 0 && noteCount === 0;
+      let slotCount = 0;
+      if (!isRest) {
+        const lyricTokenCount = lyricTokens(mBars[idx] || "").length;
+        slotCount = events.length > 0 ? Math.max(noteCount, lyricTokenCount, 1) : Math.max(lyricTokenCount, 1);
+      }
       return { is_rest: isRest, slot_count: isRest ? 0 : slotCount };
     });
     renderFullScoreSVG({

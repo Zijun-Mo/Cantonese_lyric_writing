@@ -114,6 +114,23 @@ def _tokenize_bar(bar_str: str) -> List[str]:
     return [t for t in tokens if t]
 
 
+def _strip_slur_markers(token: str) -> tuple[str, int, int]:
+    """去掉 token 两侧的连音括号，并返回开始/结束括号数量"""
+    start_count = 0
+    end_count = 0
+    inner = token.strip()
+
+    while inner.startswith('('):
+        start_count += 1
+        inner = inner[1:]
+
+    while inner.endswith(')'):
+        end_count += 1
+        inner = inner[:-1]
+
+    return inner, start_count, end_count
+
+
 def _parse_duration(suffix: str, tie_dashes: str) -> float:
     """根据后缀计算时值"""
     # 基础时值
@@ -145,6 +162,8 @@ def parse_jianpu(jianpu_str: str) -> ParsedScore:
     """
     bar_strings = jianpu_str.split('|')
     score = ParsedScore()
+    slur_depth = 0
+    slur_note: Optional[Note] = None
 
     for bar_idx, bar_str in enumerate(bar_strings):
         bar = Bar(index=bar_idx)
@@ -155,28 +174,52 @@ def parse_jianpu(jianpu_str: str) -> ParsedScore:
         last_pitched_note: Optional[Note] = None
 
         for token in tokens:
+            token, slur_starts, slur_ends = _strip_slur_markers(token)
+            if slur_starts:
+                slur_depth += slur_starts
+
+            in_slur = slur_depth > 0
+
             # 独立的延音符号（一个或多个 -）
             if re.fullmatch(r'-+', token):
-                if last_pitched_note is not None:
-                    last_pitched_note.duration += len(token) * 1.0
+                target_note = slur_note if in_slur and slur_note is not None else last_pitched_note
+                if target_note is not None:
+                    target_note.duration += len(token) * 1.0
+                if slur_ends:
+                    slur_depth = max(0, slur_depth - slur_ends)
+                    if slur_depth == 0:
+                        slur_note = None
                 continue
 
             m = _NOTE_PATTERN.fullmatch(token)
             if not m:
+                if slur_ends:
+                    slur_depth = max(0, slur_depth - slur_ends)
+                    if slur_depth == 0:
+                        slur_note = None
                 continue
 
             prefix, digit, suffix, tie_dashes = m.groups()
             pitch = int(digit)
+            duration = _parse_duration(suffix, tie_dashes)
 
             if pitch == 0:
-                note = Note(
-                    pitch=0,
-                    is_rest=True,
-                    bar_index=bar_idx,
-                    position_in_bar=len(pending_notes),
-                )
-                pending_notes.append(note)
-                # 休止符不影响 last_pitched_note
+                if in_slur and slur_note is not None:
+                    slur_note.duration += duration
+                else:
+                    note = Note(
+                        pitch=0,
+                        duration=duration,
+                        is_rest=True,
+                        bar_index=bar_idx,
+                        position_in_bar=len(pending_notes),
+                    )
+                    pending_notes.append(note)
+                    # 休止符不影响 last_pitched_note
+                if slur_ends:
+                    slur_depth = max(0, slur_depth - slur_ends)
+                    if slur_depth == 0:
+                        slur_note = None
                 continue
 
             # 八度
@@ -186,18 +229,26 @@ def parse_jianpu(jianpu_str: str) -> ParsedScore:
             elif prefix == ',':
                 octave = -1
 
-            duration = _parse_duration(suffix, tie_dashes)
+            if in_slur and slur_note is not None:
+                slur_note.duration += duration
+            else:
+                note = Note(
+                    pitch=pitch,
+                    octave=octave,
+                    duration=duration,
+                    is_rest=False,
+                    bar_index=bar_idx,
+                    position_in_bar=len(pending_notes),
+                )
+                pending_notes.append(note)
+                last_pitched_note = note
+                if in_slur:
+                    slur_note = note
 
-            note = Note(
-                pitch=pitch,
-                octave=octave,
-                duration=duration,
-                is_rest=False,
-                bar_index=bar_idx,
-                position_in_bar=len(pending_notes),
-            )
-            pending_notes.append(note)
-            last_pitched_note = note
+            if slur_ends:
+                slur_depth = max(0, slur_depth - slur_ends)
+                if slur_depth == 0:
+                    slur_note = None
 
         # 推断强弱拍（简化：小节内第一个音符为强拍，第三个为中强拍）
         beat_pos = 0

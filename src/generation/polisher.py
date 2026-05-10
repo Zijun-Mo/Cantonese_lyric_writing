@@ -191,7 +191,8 @@ def iterative_polish(
     paragraphs = []
     current = []
     for i, bar in enumerate(score_obj.bars):
-        if bar.is_rest_bar or bar.slot_count == 0:
+        has_fixed_placeholders = bool(bar_results.get(i, {}).get("lyric_placeholders"))
+        if bar.is_rest_bar or bar.slot_count == 0 or has_fixed_placeholders:
             if current:
                 paragraphs.append(current)
                 current = []
@@ -224,8 +225,14 @@ def iterative_polish(
             continue
 
         for iteration in range(max_iterations):
-            bar_lyrics = [bar_results[bi]["best_lyric"] for bi in chunk_bars]
-            slot_counts = [score_obj.bars[bi].slot_count for bi in chunk_bars]
+            bar_lyrics = [
+                bar_results[bi].get("generated_lyric", bar_results[bi]["best_lyric"])
+                for bi in chunk_bars
+            ]
+            slot_counts = [
+                int(bar_results[bi].get("fill_slot_count", score_obj.bars[bi].slot_count))
+                for bi in chunk_bars
+            ]
             seeds = []
             for bi in chunk_bars:
                 sem = semantics[bi] if bi < len(semantics) else None
@@ -299,6 +306,7 @@ def iterative_polish(
                     continue
 
                 bar_results[bi]["best_lyric"] = new_ly
+                bar_results[bi]["generated_lyric"] = new_ly
                 bar_results[bi]["score"] = new_sc
                 improved += 1
                 logger.info(
