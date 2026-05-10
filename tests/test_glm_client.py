@@ -91,6 +91,24 @@ class GLMClientTest(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertGreaterEqual(payload["max_tokens"], 4096)
 
+    @mock.patch("src.generation.glm_client.time.sleep", return_value=None)
+    def test_chunked_connection_error_is_retried(self, _sleep):
+        patcher = mock.patch("src.generation.glm_client.requests.post")
+        post = patcher.start()
+        self.addCleanup(patcher.stop)
+        post.side_effect = [
+            __import__("requests").exceptions.ChunkedEncodingError("InvalidChunkLength"),
+            _FakeResponse('{"answer": "ok"}'),
+        ]
+        client = GLMClient(provider="deepseek", api_key="deepseek-key", max_retries=2)
+
+        with self.assertLogs("src.generation.llm_client", level="WARNING") as logs:
+            result = client.chat_json([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(result, {"answer": "ok"})
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("连接中断", "\n".join(logs.output))
+
     def test_glm_quality_retry_uses_plus_model(self):
         client = GLMClient(api_key="glm-key")
         retry_client = client.for_quality_retry()

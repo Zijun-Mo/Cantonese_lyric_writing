@@ -49,6 +49,10 @@ def _get_int_config(section: str, key: str, default: int) -> int:
         return default
 
 
+def _retry_wait_seconds(attempt: int) -> int:
+    return min(2 ** attempt, 8)
+
+
 class GLMClient:
     """GLM / DeepSeek API 客户端。
 
@@ -190,7 +194,7 @@ class GLMClient:
                 )
 
                 if resp.status_code == 429:
-                    wait = 2 ** attempt
+                    wait = _retry_wait_seconds(attempt)
                     logger.warning(f"限流，等待 {wait}s 后重试")
                     time.sleep(wait)
                     continue
@@ -225,21 +229,39 @@ class GLMClient:
                 return None
 
             except requests.exceptions.Timeout:
+                wait = _retry_wait_seconds(attempt)
                 logger.warning(
                     f"{self.mode_label()} 请求超时 "
-                    f"(timeout={self.timeout_seconds}s, 第 {attempt+1} 次)"
+                    f"(timeout={self.timeout_seconds}s, 第 {attempt+1}/{self.max_retries} 次)"
                 )
                 if attempt < self.max_retries - 1:
-                    time.sleep(1)
+                    time.sleep(wait)
                 continue
+            except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError) as e:
+                wait = _retry_wait_seconds(attempt)
+                if attempt < self.max_retries - 1:
+                    logger.warning(
+                        f"{self.mode_label()} 连接中断，等待 {wait}s 后重试 "
+                        f"(第 {attempt+1}/{self.max_retries} 次): {e}"
+                    )
+                    time.sleep(wait)
+                    continue
+                logger.error(f"{self.mode_label()} 连接中断，多次重试仍失败: {e}")
+                return None
             except (KeyError, IndexError, json.JSONDecodeError) as e:
                 logger.error(f"解析响应失败: {e}")
                 return None
             except requests.exceptions.RequestException as e:
-                logger.error(f"请求异常: {e}")
+                wait = _retry_wait_seconds(attempt)
                 if attempt < self.max_retries - 1:
-                    time.sleep(1)
-                continue
+                    logger.warning(
+                        f"{self.mode_label()} 请求异常，等待 {wait}s 后重试 "
+                        f"(第 {attempt+1}/{self.max_retries} 次): {e}"
+                    )
+                    time.sleep(wait)
+                    continue
+                logger.error(f"{self.mode_label()} 请求异常，多次重试仍失败: {e}")
+                return None
 
         return None
 
